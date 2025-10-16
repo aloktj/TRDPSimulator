@@ -24,6 +24,11 @@ MdSenderWorker::~MdSenderWorker()
 void MdSenderWorker::start()
 {
     if (config_.cycleTimeMs == 0) {
+        try {
+            adapter_.send_md_request(config_.name, payload_);
+        } catch (const std::exception &ex) {
+            logger_.error("MD request failed for '" + config_.name + "': " + ex.what());
+        }
         return;
     }
     if (running_.exchange(true)) {

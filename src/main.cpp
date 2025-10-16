@@ -45,6 +45,15 @@ int main(int argc, char **argv)
     }
 
     try {
+#ifdef TRDP_STACK_VERSION
+        std::cout << "TRDP Simulator targeting TRDP stack version " << TRDP_STACK_VERSION;
+#ifdef TRDPSIM_WITH_TRDP
+        std::cout << " (real stack)";
+#else
+        std::cout << " (stub adapter)";
+#endif
+        std::cout << std::endl;
+#endif
         auto config = trdp_sim::load_configuration(configPath);
         auto adapter = trdp_sim::create_trdp_stack_adapter();
         trdp_sim::Simulator simulator(std::move(config), std::move(adapter));
