@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
-#include <unordered_set>
 
 #include "tinyxml2.h"
 #include "trdp_simulator/config.hpp"
@@ -163,45 +162,6 @@ LogLevel parse_log_level(const std::string &value)
 
 }  // namespace
 
-void validate_configuration(const SimulatorConfig &config)
-{
-    if (config.network.interfaceName.empty()) {
-        throw std::runtime_error("Network interface name must not be empty");
-    }
-
-    auto ensure_unique = [](const auto &items, const char *kind) {
-        std::unordered_set<std::string> names;
-        for (const auto &item : items) {
-            if (!names.insert(item.name).second) {
-                throw std::runtime_error(std::string("Duplicate ") + kind + " name '" + item.name + "'");
-            }
-        }
-    };
-
-    ensure_unique(config.pdPublishers, "PD publisher");
-    ensure_unique(config.pdSubscribers, "PD subscriber");
-    ensure_unique(config.mdSenders, "MD sender");
-    ensure_unique(config.mdListeners, "MD listener");
-
-    for (const auto &publisher : config.pdPublishers) {
-        if (publisher.cycleTimeMs == 0) {
-            throw std::runtime_error("PD publisher '" + publisher.name + "' must specify cycleTimeMs > 0");
-        }
-    }
-
-    for (const auto &sender : config.mdSenders) {
-        if (sender.expectReply && sender.replyTimeoutMs == 0) {
-            throw std::runtime_error("MD sender '" + sender.name + "' expects a reply but replyTimeoutMs is 0");
-        }
-    }
-
-    for (const auto &listener : config.mdListeners) {
-        if (listener.autoReply && listener.replyPayload.value.empty()) {
-            throw std::runtime_error("MD listener '" + listener.name + "' autoReply requires a replyPayload");
-        }
-    }
-}
-
 SimulatorConfig load_configuration(const std::string &path)
 {
     tinyxml2::XMLDocument doc;
@@ -251,7 +211,6 @@ SimulatorConfig load_configuration(const std::string &path)
         }
     }
 
-    validate_configuration(config);
     return config;
 }
 

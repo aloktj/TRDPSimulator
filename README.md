@@ -9,8 +9,6 @@ TRDP Simulator is a cross-platform command line tool that sends and receives TRD
 - XML based configuration describing network interfaces, PD publishers/subscribers, and MD senders/listeners.
 - Built-in payload helpers (hex, text, or file sourced) and periodic transmission scheduling.
 - Graceful shutdown handling and structured logging to console and/or file.
-- Configuration validation catches duplicate names, invalid scheduling intervals, and incomplete auto-reply definitions before the
-  simulator starts.
 
 ## Repository layout
 
@@ -65,7 +63,6 @@ A single XML file controls every aspect of the simulator. See [`docs/configurati
 - `<logging>` — log level, console enable/disable, and optional log file path.
 - `<pd>` — define any number of `<publisher>` and `<subscriber>` entries with COMIDs, dataset IDs, cycle times, and payload definitions.
 - `<md>` — configure `<sender>` and `<listener>` elements for message data with reply expectations and automatic responses.
-- MD senders with `cycleTimeMs="0"` transmit a single request at startup instead of running a periodic loop.
 
 Payloads accept three formats:
 
