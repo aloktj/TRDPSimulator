@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<trdpSimulator>
+  <network interface="eth0" hostIp="192.168.1.10" gateway="192.168.1.1" ttl="64" vlanId="0" />
+  <logging level="info" console="true" file="trdp-simulator.log" />
+
+  <pd>
+    <publisher name="CabToPropulsion" comId="1001" datasetId="1" cycleTimeMs="500" destIp="239.10.0.1">
+      <payload format="hex">0102030405</payload>
+    </publisher>
+
+    <subscriber name="DoorsController" comId="1002" timeoutMs="2000" destIp="239.10.0.2" />
+  </pd>
+
+  <md>
+    <sender name="MaintenanceRequest" comId="2001" replyComId="2002" destIp="192.168.1.20" cycleTimeMs="5000" expectReply="true" replyTimeoutMs="2000">
+      <payload format="text">Diagnostics request</payload>
+    </sender>
+
+    <listener name="MaintenanceReply" comId="2002" sourceIp="192.168.1.20" autoReply="true">
+      <replyPayload format="text">Diagnostics OK</replyPayload>
+    </listener>
+  </md>
+</trdpSimulator>
