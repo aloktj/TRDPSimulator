@@ -46,6 +46,12 @@ TRDP Simulator is a cross-platform command line tool that sends and receives TRD
     The `TRDPSimulator_TRDP_VERSION` cache entry selects which stack to target. Leave it unset or set it to `latest` to use the newest entry from `TRDPSimulator_SUPPORTED_TRDP_VERSIONS`. Supply a specific version (for example `2.0.3.0`) when you must match a particular device under test. Enable `-DTRDPSimulator_BUILD_ALL_TRDP_VERSIONS=ON` to produce a simulator binary for every version listed in `TRDPSimulator_SUPPORTED_TRDP_VERSIONS` in a single build.
 
     If the TRDP stack is not available on the build machine, omit `-DTRDPSimulator_ENABLE_TRDP=ON`. The simulator will then fall back to a stubbed adapter that performs loop-back testing but does not emit real network traffic.
+   ```bash
+   cmake -S . -B build -DTRDPSimulator_ENABLE_TRDP=ON -DTRDP_ROOT=/path/to/trdp
+   cmake --build build
+   ```
+
+   If the TRDP stack is not available on the build machine, omit `-DTRDPSimulator_ENABLE_TRDP=ON`. The simulator will then fall back to a stubbed adapter that performs loop-back testing but does not emit real network traffic.
 
 3. **Install (optional)**
 
