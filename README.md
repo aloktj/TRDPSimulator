@@ -31,27 +31,20 @@ TRDP Simulator is a cross-platform command line tool that sends and receives TRD
 1. **Install dependencies**
    - A C++17 capable compiler (MSVC 2019+, GCC 10+, or Clang 10+).
    - CMake 3.16 or newer.
-   - Optional: the TCNopen TRDP stack libraries and headers.
+   - Optional: the TCNopen TRDP stack sources extracted under `third_party/trdp/<version>`.
 
 2. **Configure and build**
 
     ```bash
     cmake -S . -B build \
       -DTRDPSimulator_ENABLE_TRDP=ON \
-      -DTRDPSimulator_TRDP_VERSION=3.0.0.0 \
-      -DTRDP_ROOT="${PWD}/third_party/trdp/3.0.0.0"
+      -DTRDPSimulator_TRDP_VERSION=3.0.0.0
     cmake --build build
     ```
 
     The `TRDPSimulator_TRDP_VERSION` cache entry selects which stack to target. Leave it unset or set it to `latest` to use the newest entry from `TRDPSimulator_SUPPORTED_TRDP_VERSIONS`. Supply a specific version (for example `2.0.3.0`) when you must match a particular device under test. Enable `-DTRDPSimulator_BUILD_ALL_TRDP_VERSIONS=ON` to produce a simulator binary for every version listed in `TRDPSimulator_SUPPORTED_TRDP_VERSIONS` in a single build.
 
-    If the TRDP stack is not available on the build machine, omit `-DTRDPSimulator_ENABLE_TRDP=ON`. The simulator will then fall back to a stubbed adapter that performs loop-back testing but does not emit real network traffic.
-   ```bash
-   cmake -S . -B build -DTRDPSimulator_ENABLE_TRDP=ON -DTRDP_ROOT=/path/to/trdp
-   cmake --build build
-   ```
-
-   If the TRDP stack is not available on the build machine, omit `-DTRDPSimulator_ENABLE_TRDP=ON`. The simulator will then fall back to a stubbed adapter that performs loop-back testing but does not emit real network traffic.
+    When a stack directory is discovered the build system compiles the TRDP sources with an appropriate configuration file (by default `config/LINUX_X86_64_config` on 64-bit Linux hosts). Override this selection with `-DTRDPSimulator_TRDP_CONFIG=<config_file>` if you need to target a different profile such as `RASPIAN_config`. If the TRDP stack is not available on the build machine, omit `-DTRDPSimulator_ENABLE_TRDP=ON`. The simulator will then fall back to a stubbed adapter that performs loop-back testing but does not emit real network traffic.
 
 3. **Install (optional)**
 
@@ -87,17 +80,17 @@ Payloads accept three formats:
 
 ## Integrating the TCNopen TRDP stack
 
-To exercise real TRDP traffic the simulator must be linked against the official TCNopen TRDP stack. Provide the installation location through `TRDP_ROOT` or the standard `CMAKE_PREFIX_PATH`. When found the build automatically enables the high-fidelity adapter located in `src/trdp_stack_adapter_real.cpp`, which maps the simulator operations to `tlc_*` and `tlm_*` APIs from the stack.
+To exercise real TRDP traffic the simulator must be built together with the official TCNopen TRDP stack. Place the extracted stack sources under `third_party/trdp/<version>` (for example `third_party/trdp/3.0.0.0`) and configure CMake with `-DTRDPSimulator_ENABLE_TRDP=ON`. The build system automatically compiles the stack from source, applying the configuration file chosen via `TRDPSimulator_TRDP_CONFIG` (or the auto-detected default) before linking the resulting static library into the simulator. If you keep the stacks elsewhere, point `TRDP_ROOT` or `TRDP_<version>_ROOT` to the appropriate directories and the same compilation logic will be used.
 
-> **Note:** The TRDP stack is distributed separately by TCNopen. Consult their licensing terms and download portal to obtain the latest stable release. The simulator expects headers such as `trdp_if_light.h` and `trdp_mdcom.h` to be reachable by the compiler and the corresponding libraries (`libtrdp`) to be linkable.
+> **Note:** The TRDP stack is distributed separately by TCNopen. Consult their licensing terms and download portal to obtain the latest stable release. The simulator expects headers such as `trdp_if_light.h` and `trdp_mdcom.h` under the extracted stack's `src/api` directory.
 
 ## Managing multiple TRDP stack versions
 
 Different projects often standardise on specific TRDP revisions. The build system understands this by default:
 
 1. Download the required archives from the [TCNopen TRDP releases](https://sourceforge.net/projects/tcnopen/files/TRDP/) page. Recommended versions to keep on hand are `3.0.0.0`, `2.1.0.0`, `2.0.3.0`, and `1.4.2.0`.
-2. Extract each version into `third_party/trdp/<version>` so that the headers reside under `third_party/trdp/<version>/include` (or `api`) and the libraries under `third_party/trdp/<version>/lib`.
-3. Override the auto-detected layout when necessary with the cache entries `TRDP_<version>_ROOT`. For single-version builds you can also point `TRDP_ROOT` at an installation outside the repository.
+2. Extract each version into `third_party/trdp/<version>` without modifying the directory layout from the archive. The build will look for the `src/` tree from the stack release and compile it automatically.
+3. Override the discovery path when necessary with the cache entries `TRDP_<version>_ROOT`. For single-version builds you can also point `TRDP_ROOT` at an installation outside the repository.
 4. Configure CMake with either `-DTRDPSimulator_TRDP_VERSION=<version>` or `-DTRDPSimulator_BUILD_ALL_TRDP_VERSIONS=ON` depending on whether you need one or many simulator binaries.
 
 During configuration CMake prints a status line for every simulator target indicating whether a real stack was discovered or the build fell back to the stubbed adapter. This makes it easy to verify that the desired version is active.
