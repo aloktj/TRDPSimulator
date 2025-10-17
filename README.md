@@ -44,6 +44,8 @@ TRDP Simulator is a cross-platform command line tool that sends and receives TRD
 
     The `TRDPSimulator_TRDP_VERSION` cache entry selects which stack to target. Leave it unset or set it to `latest` to use the newest entry from `TRDPSimulator_SUPPORTED_TRDP_VERSIONS`. Supply a specific version (for example `2.0.3.0`) when you must match a particular device under test. Enable `-DTRDPSimulator_BUILD_ALL_TRDP_VERSIONS=ON` to produce a simulator binary for every version listed in `TRDPSimulator_SUPPORTED_TRDP_VERSIONS` in a single build.
 
+    Single-configuration generators (Makefiles, Ninja) respect the `CMAKE_BUILD_TYPE` flag. Pass `-DCMAKE_BUILD_TYPE=Release` (or `Debug`, `RelWithDebInfo`, etc.) when configuring if you need a specific optimisation level. Multi-configuration generators such as Visual Studio require the configuration to be chosen during the build phase, for example `cmake --build build --config Release`.
+
     When a stack directory is discovered the build system compiles the TRDP sources with an appropriate configuration file (by default `config/LINUX_X86_64_config` on 64-bit Linux hosts). Override this selection with `-DTRDPSimulator_TRDP_CONFIG=<config_file>` if you need to target a different profile such as `RASPIAN_config`. If the TRDP stack is not available on the build machine, omit `-DTRDPSimulator_ENABLE_TRDP=ON`. The simulator will then fall back to a stubbed adapter that performs loop-back testing but does not emit real network traffic.
 
 3. **Install (optional)**
