@@ -228,6 +228,10 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
         return {200, "OK", "application/json", build_status_json()};
     }
 
+    if (path == "/api/metrics") {
+        return {200, "OK", "application/json", build_metrics_json()};
+    }
+
     if (path == "/api/start") {
         std::string config = extract_parameter(query, "config");
         if (config.empty() && method == "POST") {
@@ -276,6 +280,8 @@ bool WebApplication::start_simulator(const std::string &config_path, std::string
     simulator_start_pending_ = true;
     last_error_.reset();
     current_config_.clear();
+    has_metrics_snapshot_ = false;
+    last_metrics_snapshot_ = RuntimeMetrics::Snapshot{};
 
     simulator_thread_ = std::thread(&WebApplication::simulator_worker, this, config_path);
 
@@ -307,8 +313,12 @@ bool WebApplication::stop_simulator(std::string &message)
         simulator = active_simulator_;
     }
 
+    RuntimeMetrics::Snapshot snapshot;
+    bool have_snapshot = false;
     if (simulator) {
         simulator->stop();
+        snapshot = simulator->metrics_snapshot();
+        have_snapshot = true;
     }
 
     if (simulator_thread_.joinable()) {
@@ -323,6 +333,10 @@ bool WebApplication::stop_simulator(std::string &message)
         current_config_.clear();
         message = "Simulator stopped";
         last_error_.reset();
+        if (have_snapshot) {
+            last_metrics_snapshot_ = snapshot;
+            has_metrics_snapshot_ = true;
+        }
         simulator_cv_.notify_all();
     }
 
@@ -341,6 +355,86 @@ std::string WebApplication::build_status_json() const
     if (last_error_.has_value()) {
         stream << ",\"lastError\":\"" << json_escape(*last_error_) << "\"";
     }
+    stream << "}";
+    return stream.str();
+}
+
+std::string WebApplication::build_metrics_json() const
+{
+    RuntimeMetrics::Snapshot snapshot;
+    bool have_snapshot = false;
+
+    std::shared_ptr<Simulator> simulator;
+    {
+        std::lock_guard<std::mutex> lock(simulator_mutex_);
+        simulator = active_simulator_;
+        if (!simulator && has_metrics_snapshot_) {
+            snapshot = last_metrics_snapshot_;
+            have_snapshot = true;
+        }
+    }
+
+    if (simulator) {
+        snapshot = simulator->metrics_snapshot();
+        have_snapshot = true;
+        std::lock_guard<std::mutex> lock(simulator_mutex_);
+        last_metrics_snapshot_ = snapshot;
+        has_metrics_snapshot_ = true;
+    }
+
+    if (!have_snapshot) {
+        snapshot = RuntimeMetrics::Snapshot{};
+    }
+
+    std::ostringstream stream;
+    stream << "{";
+    stream << "\"running\":" << (snapshot.simulatorRunning ? "true" : "false");
+    stream << ",\"adapterInitialized\":" << (snapshot.adapterInitialized ? "true" : "false");
+    stream << ",\"adapterState\":\"" << json_escape(snapshot.adapterState) << "\"";
+
+    stream << ",\"pdPublishers\":[";
+    for (std::size_t i = 0; i < snapshot.pdPublishers.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &stats = snapshot.pdPublishers[i];
+        stream << "{\"name\":\"" << json_escape(stats.name) << "\",\"packetsSent\":" << stats.packetsSent << "}";
+    }
+    stream << "]";
+
+    stream << ",\"pdSubscribers\":[";
+    for (std::size_t i = 0; i < snapshot.pdSubscribers.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &stats = snapshot.pdSubscribers[i];
+        stream << "{\"name\":\"" << json_escape(stats.name) << "\",\"packetsReceived\":" << stats.packetsReceived
+               << "}";
+    }
+    stream << "]";
+
+    stream << ",\"mdSenders\":[";
+    for (std::size_t i = 0; i < snapshot.mdSenders.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &stats = snapshot.mdSenders[i];
+        stream << "{\"name\":\"" << json_escape(stats.name) << "\",\"requestsSent\":" << stats.requestsSent
+               << ",\"repliesReceived\":" << stats.repliesReceived << "}";
+    }
+    stream << "]";
+
+    stream << ",\"mdListeners\":[";
+    for (std::size_t i = 0; i < snapshot.mdListeners.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &stats = snapshot.mdListeners[i];
+        stream << "{\"name\":\"" << json_escape(stats.name) << "\",\"requestsReceived\":" << stats.requestsReceived
+               << ",\"repliesSent\":" << stats.repliesSent << "}";
+    }
+    stream << "]";
+
     stream << "}";
     return stream.str();
 }
@@ -379,15 +473,29 @@ void WebApplication::simulator_worker(std::string config_path)
 
         simulator->run();
 
+        RuntimeMetrics::Snapshot snapshot = simulator->metrics_snapshot();
+
         {
             std::lock_guard<std::mutex> lock(simulator_mutex_);
             simulator_running_ = false;
             active_simulator_.reset();
             current_config_.clear();
             last_error_.reset();
+            last_metrics_snapshot_ = snapshot;
+            has_metrics_snapshot_ = true;
             simulator_cv_.notify_all();
         }
     } catch (const std::exception &ex) {
+        RuntimeMetrics::Snapshot snapshot;
+        bool have_snapshot = false;
+        if (simulator) {
+            try {
+                simulator->stop();
+                snapshot = simulator->metrics_snapshot();
+                have_snapshot = true;
+            } catch (...) {
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(simulator_mutex_);
             last_error_ = ex.what();
@@ -395,6 +503,10 @@ void WebApplication::simulator_worker(std::string config_path)
             simulator_start_pending_ = false;
             active_simulator_.reset();
             current_config_.clear();
+            if (have_snapshot) {
+                last_metrics_snapshot_ = snapshot;
+                has_metrics_snapshot_ = true;
+            }
             simulator_cv_.notify_all();
         }
     }
@@ -409,7 +521,7 @@ std::string WebApplication::main_page_html()
 <title>TRDP Simulator Web</title>
 <style>
 body { font-family: sans-serif; margin: 2rem; background: #f6f8fa; color: #1f2328; }
-main { max-width: 640px; margin: 0 auto; padding: 2rem; background: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(31,35,40,0.1); }
+main { max-width: 720px; margin: 0 auto; padding: 2rem; background: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(31,35,40,0.1); }
 header { margin-bottom: 1.5rem; }
 label { display: block; margin-bottom: 0.5rem; font-weight: 600; }
 input[type="text"] { width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #d0d7de; border-radius: 4px; }
@@ -417,8 +529,14 @@ button { padding: 0.5rem 1rem; margin-right: 0.5rem; border: none; border-radius
 button.start { background: #238636; color: #ffffff; }
 button.stop { background: #d1242f; color: #ffffff; }
 section { margin-top: 1.5rem; }
-pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; }
+pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; border: 1px solid #d0d7de; }
 #status { font-weight: 600; }
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.metrics-grid h3 { margin-top: 0; font-size: 1.05rem; }
+.metrics-grid ul { list-style: none; padding: 0.75rem; margin: 0; background: #f6f8fa; border-radius: 4px; border: 1px solid #d0d7de; }
+.metrics-grid li { margin-bottom: 0.5rem; font-size: 0.95rem; }
+.metrics-grid li:last-child { margin-bottom: 0; }
+.metrics-grid li.muted { color: #57606a; font-style: italic; }
 </style>
 </head>
 <body>
@@ -436,24 +554,99 @@ pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; }
 <section>
 <h2>Status</h2>
 <p id="status">Loading...</p>
+<p><strong>Simulator:</strong> <span id="simulatorState">Unknown</span></p>
 <pre id="details"></pre>
+</section>
+<section>
+<h2>Telemetry</h2>
+<p><strong>Adapter:</strong> <span id="adapterState">Idle</span></p>
+<div class="metrics-grid">
+  <div>
+    <h3>PD Publishers</h3>
+    <ul id="pdPublishersList"><li class="muted">No data</li></ul>
+  </div>
+  <div>
+    <h3>PD Subscribers</h3>
+    <ul id="pdSubscribersList"><li class="muted">No data</li></ul>
+  </div>
+  <div>
+    <h3>MD Senders</h3>
+    <ul id="mdSendersList"><li class="muted">No data</li></ul>
+  </div>
+  <div>
+    <h3>MD Listeners</h3>
+    <ul id="mdListenersList"><li class="muted">No data</li></ul>
+  </div>
+</div>
+<pre id="metricsRaw"></pre>
 </section>
 </main>
 <script>
+function renderMetricList(elementId, items, formatter, emptyMessage) {
+  const list = document.getElementById(elementId);
+  if (!list) {
+    return;
+  }
+  list.innerHTML = '';
+  if (!Array.isArray(items) || items.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = emptyMessage;
+    li.classList.add('muted');
+    list.appendChild(li);
+    return;
+  }
+  items.forEach((item) => {
+    const li = document.createElement('li');
+    li.textContent = formatter(item);
+    list.appendChild(li);
+  });
+}
+
 async function refreshStatus() {
   try {
     const response = await fetch('/api/status');
     const data = await response.json();
     const status = document.getElementById('status');
     const details = document.getElementById('details');
+    const simulatorState = document.getElementById('simulatorState');
     if (data.running) {
       status.textContent = 'Simulator is running';
+      simulatorState.textContent = 'Running';
     } else {
       status.textContent = 'Simulator is stopped';
+      simulatorState.textContent = 'Stopped';
     }
     details.textContent = JSON.stringify(data, null, 2);
   } catch (err) {
     document.getElementById('status').textContent = 'Unable to query status';
+    document.getElementById('simulatorState').textContent = 'Unknown';
+  }
+}
+
+async function refreshMetrics() {
+  try {
+    const response = await fetch('/api/metrics');
+    if (!response.ok) {
+      throw new Error('Request failed');
+    }
+    const data = await response.json();
+    document.getElementById('adapterState').textContent = data.adapterState || 'Unknown';
+    renderMetricList('pdPublishersList', data.pdPublishers || [],
+      (item) => `${item.name}: ${item.packetsSent} packets sent`, 'No PD publishers');
+    renderMetricList('pdSubscribersList', data.pdSubscribers || [],
+      (item) => `${item.name}: ${item.packetsReceived} packets received`, 'No PD subscribers');
+    renderMetricList('mdSendersList', data.mdSenders || [],
+      (item) => `${item.name}: ${item.requestsSent} requests / ${item.repliesReceived} replies`, 'No MD senders');
+    renderMetricList('mdListenersList', data.mdListeners || [],
+      (item) => `${item.name}: ${item.requestsReceived} requests / ${item.repliesSent} replies`, 'No MD listeners');
+    document.getElementById('metricsRaw').textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    document.getElementById('adapterState').textContent = 'Unavailable';
+    renderMetricList('pdPublishersList', [], null, 'No data available');
+    renderMetricList('pdSubscribersList', [], null, 'No data available');
+    renderMetricList('mdSendersList', [], null, 'No data available');
+    renderMetricList('mdListenersList', [], null, 'No data available');
+    document.getElementById('metricsRaw').textContent = 'Unable to query metrics';
   }
 }
 
@@ -471,6 +664,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
     alert(data.error || 'Unable to start simulator');
   }
   refreshStatus();
+  refreshMetrics();
 });
 
 document.getElementById('stopBtn').addEventListener('click', async () => {
@@ -482,10 +676,15 @@ document.getElementById('stopBtn').addEventListener('click', async () => {
     alert(data.error || 'Simulator not running');
   }
   refreshStatus();
+  refreshMetrics();
 });
 
 refreshStatus();
-setInterval(refreshStatus, 3000);
+refreshMetrics();
+setInterval(() => {
+  refreshStatus();
+  refreshMetrics();
+}, 3000);
 </script>
 </body>
 </html>)HTML";

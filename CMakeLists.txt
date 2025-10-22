@@ -42,6 +42,7 @@ set(TRDP_SIMULATOR_CORE_SOURCES
     src/config.cpp
     src/config_loader.cpp
     src/logger.cpp
+    src/runtime_metrics.cpp
     src/simulator.cpp
     src/trdp_md_worker.cpp
     src/trdp_pd_worker.cpp

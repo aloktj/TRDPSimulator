@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 
+#include "trdp_simulator/runtime_metrics.hpp"
+
 namespace trdp_sim {
 
 class Simulator;
@@ -36,6 +38,7 @@ private:
     bool start_simulator(const std::string &config_path, std::string &message);
     bool stop_simulator(std::string &message);
     std::string build_status_json() const;
+    std::string build_metrics_json() const;
 
     static std::string main_page_html();
     static std::string json_escape(const std::string &value);
@@ -58,6 +61,8 @@ private:
     bool simulator_start_pending_{false};
     std::string current_config_;
     std::optional<std::string> last_error_;
+    mutable RuntimeMetrics::Snapshot last_metrics_snapshot_;
+    mutable bool has_metrics_snapshot_{false};
 };
 
 }  // namespace trdp_sim
