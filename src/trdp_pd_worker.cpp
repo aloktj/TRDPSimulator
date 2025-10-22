@@ -44,7 +44,12 @@ void PdPublisherWorker::run()
     const auto interval = std::chrono::milliseconds(config_.cycleTimeMs);
     while (running_) {
         try {
-            adapter_.publish_pd(config_.name, payload_);
+            std::vector<std::uint8_t> payloadCopy;
+            {
+                std::lock_guard<std::mutex> lock(payloadMutex_);
+                payloadCopy = payload_;
+            }
+            adapter_.publish_pd(config_.name, payloadCopy);
             metrics_.record_pd_publish(config_.name);
         } catch (const std::exception &ex) {
             logger_.error("PD publish failed for '" + config_.name + "': " + ex.what());
@@ -52,6 +57,31 @@ void PdPublisherWorker::run()
         std::this_thread::sleep_for(interval);
     }
     logger_.info("Stopping PD publisher '" + config_.name + "'");
+}
+
+PayloadConfig PdPublisherWorker::payload_config() const
+{
+    std::lock_guard<std::mutex> lock(payloadMutex_);
+    return config_.payload;
+}
+
+bool PdPublisherWorker::update_payload(PayloadConfig::Format format, const std::string &value, std::string &error_message)
+{
+    PayloadConfig payloadSpec;
+    payloadSpec.format = format;
+    payloadSpec.value = value;
+    try {
+        auto data = load_payload(payloadSpec);
+        {
+            std::lock_guard<std::mutex> lock(payloadMutex_);
+            payload_ = std::move(data);
+            config_.payload = payloadSpec;
+        }
+        return true;
+    } catch (const std::exception &ex) {
+        error_message = ex.what();
+        return false;
+    }
 }
 
 }  // namespace trdp_sim

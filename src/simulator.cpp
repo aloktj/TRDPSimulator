@@ -234,4 +234,72 @@ RuntimeMetrics::Snapshot Simulator::metrics_snapshot() const
     return RuntimeMetrics::Snapshot{};
 }
 
+SimulatorConfig Simulator::current_config() const
+{
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return config_;
+}
+
+bool Simulator::set_pd_payload(const std::string &publisher_name,
+                               PayloadConfig::Format format,
+                               const std::string &value,
+                               std::string &error_message)
+{
+    if (!running_.load()) {
+        error_message = "Simulator is not running";
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    for (auto &worker : pdWorkers_) {
+        if (worker && worker->name() == publisher_name) {
+            if (worker->update_payload(format, value, error_message)) {
+                for (auto &configPublisher : config_.pdPublishers) {
+                    if (configPublisher.name == publisher_name) {
+                        configPublisher.payload.format = format;
+                        configPublisher.payload.value = value;
+                        break;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+
+    error_message = "PD publisher not found";
+    return false;
+}
+
+bool Simulator::set_md_payload(const std::string &sender_name,
+                               PayloadConfig::Format format,
+                               const std::string &value,
+                               std::string &error_message)
+{
+    if (!running_.load()) {
+        error_message = "Simulator is not running";
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    for (auto &worker : mdWorkers_) {
+        if (worker && worker->name() == sender_name) {
+            if (worker->update_payload(format, value, error_message)) {
+                for (auto &configSender : config_.mdSenders) {
+                    if (configSender.name == sender_name) {
+                        configSender.payload.format = format;
+                        configSender.payload.value = value;
+                        break;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+
+    error_message = "MD sender not found";
+    return false;
+}
+
 }  // namespace trdp_sim

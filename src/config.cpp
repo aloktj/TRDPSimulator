@@ -55,6 +55,38 @@ std::vector<std::uint8_t> from_file(const std::string &path)
 }
 }  // namespace
 
+std::string payload_format_to_string(PayloadConfig::Format format)
+{
+    switch (format) {
+    case PayloadConfig::Format::Hex:
+        return "hex";
+    case PayloadConfig::Format::Text:
+        return "text";
+    case PayloadConfig::Format::File:
+        return "file";
+    }
+    throw std::runtime_error("Unsupported payload format");
+}
+
+PayloadConfig::Format payload_format_from_string(const std::string &value)
+{
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (unsigned char c : value) {
+        lowered.push_back(static_cast<char>(std::tolower(c)));
+    }
+    if (lowered == "hex") {
+        return PayloadConfig::Format::Hex;
+    }
+    if (lowered == "text") {
+        return PayloadConfig::Format::Text;
+    }
+    if (lowered == "file") {
+        return PayloadConfig::Format::File;
+    }
+    throw std::runtime_error("Unsupported payload format: " + value);
+}
+
 std::vector<std::uint8_t> load_payload(const PayloadConfig &payload)
 {
     switch (payload.format) {
