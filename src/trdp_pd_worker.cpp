@@ -7,8 +7,9 @@ namespace trdp_sim {
 
 PdPublisherWorker::PdPublisherWorker(const PdPublisherConfig &config,
                                      TrdpStackAdapter &adapter,
-                                     Logger &logger)
-    : config_(config), adapter_(adapter), logger_(logger)
+                                     Logger &logger,
+                                     RuntimeMetrics &metrics)
+    : config_(config), adapter_(adapter), logger_(logger), metrics_(metrics)
 {
     payload_ = load_payload(config.payload);
     adapter_.register_pd_publisher(config_);
@@ -44,6 +45,7 @@ void PdPublisherWorker::run()
     while (running_) {
         try {
             adapter_.publish_pd(config_.name, payload_);
+            metrics_.record_pd_publish(config_.name);
         } catch (const std::exception &ex) {
             logger_.error("PD publish failed for '" + config_.name + "': " + ex.what());
         }
@@ -53,3 +55,4 @@ void PdPublisherWorker::run()
 }
 
 }  // namespace trdp_sim
+

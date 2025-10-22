@@ -24,7 +24,8 @@ std::string to_hex(const std::vector<std::uint8_t> &data)
 }  // namespace
 
 Simulator::Simulator(SimulatorConfig config, std::unique_ptr<TrdpStackAdapter> adapter)
-    : config_(std::move(config)), adapter_(std::move(adapter)), logger_(config_.logging.level)
+    : config_(std::move(config)), adapter_(std::move(adapter)), logger_(config_.logging.level),
+      metrics_(std::make_shared<RuntimeMetrics>())
 {
 }
 
@@ -37,66 +38,104 @@ void Simulator::run()
 {
     setup_logging();
 
-    logger_.info("Initializing TRDP stack");
-    adapter_->initialize(config_.network, config_.logging);
-
-    running_.store(true);
-    cleanedUp_ = false;
-
-    // Register PD subscribers
-    for (const auto &subscriber : config_.pdSubscribers) {
-        adapter_->register_pd_subscriber(subscriber, [this, name = subscriber.name](const PdMessage &message) {
-            logger_.info("PD subscriber '" + name + "' received COMID " + std::to_string(message.comId) +
-                         " payload=" + to_hex(message.payload));
-        });
+    if (metrics_) {
+        metrics_->reset();
+        metrics_->set_simulator_running(true);
+        metrics_->set_adapter_status(false, "Initializing");
     }
 
-    // Register MD listeners
-    for (const auto &listener : config_.mdListeners) {
-        std::vector<std::uint8_t> replyPayload;
-        if (listener.autoReply && !listener.replyPayload.value.empty()) {
-            replyPayload = load_payload(listener.replyPayload);
+    logger_.info("Initializing TRDP stack");
+    try {
+        adapter_->initialize(config_.network, config_.logging);
+        if (metrics_) {
+            metrics_->set_adapter_status(true, "Running");
         }
-        adapter_->register_md_listener(listener,
-            [this, cfg = listener, replyPayload](const MdMessage &message) mutable {
-                logger_.info("MD listener '" + cfg.name + "' received COMID " + std::to_string(message.comId) +
+    } catch (const std::exception &ex) {
+        if (metrics_) {
+            metrics_->set_adapter_status(false, std::string("Initialization failed: ") + ex.what());
+            metrics_->set_simulator_running(false);
+        }
+        throw;
+    }
+
+    try {
+        running_.store(true);
+        cleanedUp_ = false;
+
+        // Register PD subscribers
+        for (const auto &subscriber : config_.pdSubscribers) {
+            adapter_->register_pd_subscriber(subscriber, [this, name = subscriber.name](const PdMessage &message) {
+                logger_.info("PD subscriber '" + name + "' received COMID " + std::to_string(message.comId) +
                              " payload=" + to_hex(message.payload));
-                if (cfg.autoReply && !replyPayload.empty()) {
-                    try {
-                        adapter_->send_md_reply(cfg.name, message, replyPayload);
-                        logger_.info("MD listener '" + cfg.name + "' sent automatic reply");
-                    } catch (const std::exception &ex) {
-                        logger_.error("MD listener '" + cfg.name + "' failed to send reply: " + ex.what());
-                    }
+                if (metrics_) {
+                    metrics_->record_pd_receive(name);
                 }
             });
-    }
+        }
 
-    setup_pd_workers();
-    setup_md_workers();
-    start_event_loop();
+        // Register MD listeners
+        for (const auto &listener : config_.mdListeners) {
+            std::vector<std::uint8_t> replyPayload;
+            if (listener.autoReply && !listener.replyPayload.value.empty()) {
+                replyPayload = load_payload(listener.replyPayload);
+            }
+            adapter_->register_md_listener(listener,
+                [this, cfg = listener, replyPayload](const MdMessage &message) mutable {
+                    if (metrics_) {
+                        metrics_->record_md_request_received(cfg.name);
+                    }
+                    logger_.info("MD listener '" + cfg.name + "' received COMID " + std::to_string(message.comId) +
+                                 " payload=" + to_hex(message.payload));
+                    if (cfg.autoReply && !replyPayload.empty()) {
+                        try {
+                            adapter_->send_md_reply(cfg.name, message, replyPayload);
+                            if (metrics_) {
+                                metrics_->record_md_reply_sent(cfg.name);
+                            }
+                            logger_.info("MD listener '" + cfg.name + "' sent automatic reply");
+                        } catch (const std::exception &ex) {
+                            logger_.error("MD listener '" + cfg.name + "' failed to send reply: " + ex.what());
+                        }
+                    }
+                });
+        }
 
-    for (auto &worker : pdWorkers_) {
-        worker->start();
-    }
-    for (auto &worker : mdWorkers_) {
-        worker->start();
-    }
+        setup_pd_workers();
+        setup_md_workers();
+        start_event_loop();
 
-    std::unique_lock<std::mutex> lock(stateMutex_);
-    stateCv_.wait(lock, [this] { return !running_.load(); });
+        for (auto &worker : pdWorkers_) {
+            worker->start();
+        }
+        for (auto &worker : mdWorkers_) {
+            worker->start();
+        }
 
-    // Cleanup is handled after exit
-    if (!cleanedUp_) {
-        cleanedUp_ = true;
-        lock.unlock();
-        stop();
+        std::unique_lock<std::mutex> lock(stateMutex_);
+        stateCv_.wait(lock, [this] { return !running_.load(); });
+
+        // Cleanup is handled after exit
+        if (!cleanedUp_) {
+            cleanedUp_ = true;
+            lock.unlock();
+            stop();
+        }
+    } catch (const std::exception &ex) {
+        if (metrics_) {
+            metrics_->set_adapter_status(false, std::string("Error: ") + ex.what());
+            metrics_->set_simulator_running(false);
+        }
+        throw;
     }
 }
 
 void Simulator::stop()
 {
     const bool wasRunning = running_.exchange(false);
+    std::string priorState;
+    if (metrics_) {
+        priorState = metrics_->snapshot().adapterState;
+    }
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         stateCv_.notify_all();
@@ -131,6 +170,17 @@ void Simulator::stop()
         pdWorkers_.clear();
         mdWorkers_.clear();
     }
+
+    if (metrics_) {
+        const bool hadError = !priorState.empty() &&
+                               (priorState.rfind("Error", 0) == 0 || priorState.rfind("Initialization failed", 0) == 0);
+        if (hadError) {
+            metrics_->set_adapter_status(false, priorState);
+        } else {
+            metrics_->set_adapter_status(false, "Stopped");
+        }
+        metrics_->set_simulator_running(false);
+    }
 }
 
 void Simulator::setup_logging()
@@ -149,14 +199,14 @@ void Simulator::setup_logging()
 void Simulator::setup_pd_workers()
 {
     for (const auto &publisher : config_.pdPublishers) {
-        pdWorkers_.push_back(std::make_unique<PdPublisherWorker>(publisher, *adapter_, logger_));
+        pdWorkers_.push_back(std::make_unique<PdPublisherWorker>(publisher, *adapter_, logger_, *metrics_));
     }
 }
 
 void Simulator::setup_md_workers()
 {
     for (const auto &sender : config_.mdSenders) {
-        mdWorkers_.push_back(std::make_unique<MdSenderWorker>(sender, *adapter_, logger_));
+        mdWorkers_.push_back(std::make_unique<MdSenderWorker>(sender, *adapter_, logger_, *metrics_));
     }
 }
 
@@ -174,6 +224,14 @@ void Simulator::start_event_loop()
             }
         }
     });
+}
+
+RuntimeMetrics::Snapshot Simulator::metrics_snapshot() const
+{
+    if (metrics_) {
+        return metrics_->snapshot();
+    }
+    return RuntimeMetrics::Snapshot{};
 }
 
 }  // namespace trdp_sim

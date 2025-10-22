@@ -7,6 +7,7 @@
 
 #include "trdp_simulator/config.hpp"
 #include "trdp_simulator/logger.hpp"
+#include "trdp_simulator/runtime_metrics.hpp"
 #include "trdp_simulator/trdp_stack_adapter.hpp"
 
 namespace trdp_sim {
@@ -15,7 +16,8 @@ class PdPublisherWorker {
 public:
     PdPublisherWorker(const PdPublisherConfig &config,
                       TrdpStackAdapter &adapter,
-                      Logger &logger);
+                      Logger &logger,
+                      RuntimeMetrics &metrics);
     ~PdPublisherWorker();
 
     void start();
@@ -27,6 +29,7 @@ private:
     PdPublisherConfig config_;
     TrdpStackAdapter &adapter_;
     Logger &logger_;
+    RuntimeMetrics &metrics_;
 
     std::atomic<bool> running_{false};
     std::thread workerThread_;
@@ -34,3 +37,4 @@ private:
 };
 
 }  // namespace trdp_sim
+
