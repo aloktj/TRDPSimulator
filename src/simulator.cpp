@@ -1,9 +1,11 @@
 #include "trdp_simulator/simulator.hpp"
 
 #include <csignal>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <thread>
+#include <system_error>
 
 #include "trdp_simulator/trdp_md_worker.hpp"
 #include "trdp_simulator/trdp_pd_worker.hpp"
@@ -188,6 +190,15 @@ void Simulator::setup_logging()
     logger_.set_level(config_.logging.level);
     logger_.enable_console(config_.logging.enableConsole);
     if (!config_.logging.filePath.empty()) {
+        const std::filesystem::path logPath(config_.logging.filePath);
+        if (logPath.has_parent_path()) {
+            std::error_code ec;
+            std::filesystem::create_directories(logPath.parent_path(), ec);
+            if (ec) {
+                throw std::runtime_error("Unable to create log directory '" + logPath.parent_path().string() +
+                                         "': " + ec.message());
+            }
+        }
         logFile_ = std::make_unique<std::ofstream>(config_.logging.filePath, std::ios::app);
         if (!logFile_->is_open()) {
             throw std::runtime_error("Unable to open log file: " + config_.logging.filePath);
