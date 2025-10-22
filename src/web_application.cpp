@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -149,6 +150,54 @@ WebApplication::HttpResponse WebApplication::write_config_file(const std::string
            << json_escape(relative_path) << "\",\"absolutePath\":\""
            << json_escape(absolute_path_string(full_path)) << "\"}";
     return {200, "OK", "application/json", stream.str()};
+}
+
+bool WebApplication::is_safe_config_relative_path(const std::string &path)
+{
+    if (path.empty()) {
+        return false;
+    }
+
+    std::filesystem::path fs_path(path);
+    if (fs_path.is_absolute()) {
+        return false;
+    }
+
+    auto normalised = fs_path.lexically_normal();
+    if (normalised.empty()) {
+        return false;
+    }
+
+    for (const auto &element : normalised) {
+        if (element == "..") {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool WebApplication::is_xml_file_name(const std::string &name)
+{
+    if (name.empty()) {
+        return false;
+    }
+
+    auto extension = std::filesystem::path(name).extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return extension == ".xml";
+}
+
+std::filesystem::path WebApplication::config_root()
+{
+    if (const char *env = std::getenv("TRDP_SIMULATOR_CONFIG_ROOT")) {
+        if (*env != '\0') {
+            return std::filesystem::path(env);
+        }
+    }
+    return std::filesystem::current_path() / "config" / "library";
 }
 
 WebApplication::WebApplication(std::string host, unsigned short port)
@@ -346,18 +395,8 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
         return respond_json(200, build_metrics_json());
     }
 
-    if (path == "/api/configs") {
-        std::ostringstream stream;
-        stream << "{\"configs\":[";
-        auto configs = config_store_.list();
-        for (std::size_t i = 0; i < configs.size(); ++i) {
-            if (i != 0) {
-                stream << ',';
-            }
-            stream << "{\"name\":\"" << json_escape(configs[i]) << "\"}";
-        }
-        stream << "]}";
-        return respond_json(200, stream.str());
+    if (path == "/api/configs" || path == "/api/config/list") {
+        return handle_list_configs();
     }
 
     if (path == "/api/config/parse" && method == "POST") {
@@ -382,58 +421,11 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
     }
 
     if (path == "/api/config/save" && method == "POST") {
-        auto params = parse_form_urlencoded(body);
-        auto name_it = params.find("name");
-        auto xml_it = params.find("xml");
-        if (name_it == params.end() || name_it->second.empty()) {
-            return respond_json(400, "{\"error\":\"Missing name parameter\"}");
-        }
-        if (xml_it == params.end() || xml_it->second.empty()) {
-            return respond_json(400, "{\"error\":\"Missing xml parameter\"}");
-        }
-        const std::string &name = name_it->second;
-        if (!ConfigStore::is_valid_name(name)) {
-            return respond_json(400, "{\"error\":\"Invalid configuration name\"}");
-        }
-        try {
-            auto config = load_configuration_from_string(xml_it->second);
-            (void)config;
-            bool replaced = config_store_.exists(name);
-            config_store_.save(name, xml_it->second);
-            std::ostringstream stream;
-            stream << "{\"message\":\"Configuration saved\",\"name\":\"" << json_escape(name)
-                   << "\",\"replaced\":" << (replaced ? "true" : "false") << "}";
-            return respond_json(200, stream.str());
-        } catch (const std::exception &ex) {
-            return respond_json(400, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
-        }
+        return handle_save_config(body);
     }
 
     if (path == "/api/config/details") {
-        std::string name = extract_parameter(query, "name");
-        if (name.empty() && method == "POST") {
-            auto params = parse_form_urlencoded(body);
-            auto it = params.find("name");
-            if (it != params.end()) {
-                name = it->second;
-            }
-        }
-        if (name.empty()) {
-            return respond_json(400, "{\"error\":\"Missing name parameter\"}");
-        }
-        if (!ConfigStore::is_valid_name(name)) {
-            return respond_json(400, "{\"error\":\"Invalid configuration name\"}");
-        }
-        try {
-            auto xml = config_store_.load_xml(name);
-            auto config = load_configuration_from_string(xml);
-            std::ostringstream stream;
-            stream << "{\"name\":\"" << json_escape(name) << "\",\"summary\":"
-                   << build_config_summary_json(config) << ",\"xml\":\"" << json_escape(xml) << "\"}";
-            return respond_json(200, stream.str());
-        } catch (const std::exception &ex) {
-            return respond_json(404, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
-        }
+        return handle_get_config(method, query, body);
     }
 
     if (path == "/api/simulator/payloads") {
@@ -479,16 +471,8 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
         }
     }
 
-    if (path == "/api/config/list") {
-        return handle_list_configs();
-    }
-
     if (path == "/api/config" && method == "GET") {
-        return handle_get_config(query);
-    }
-
-    if (path == "/api/config/save" && method == "POST") {
-        return handle_save_config(body);
+        return handle_get_config(method, query, body);
     }
 
     if (path == "/api/config/upload" && method == "POST") {
@@ -538,6 +522,112 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
     }
 
     return respond_json(404, "{\"error\":\"Not found\"}");
+}
+
+WebApplication::HttpResponse WebApplication::handle_list_configs()
+{
+    std::ostringstream stream;
+    stream << "{\"configs\":[";
+    auto configs = config_store_.list();
+    for (std::size_t i = 0; i < configs.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        stream << "{\"name\":\"" << json_escape(configs[i]) << "\"}";
+    }
+    stream << "]}";
+    return respond_json(200, stream.str());
+}
+
+WebApplication::HttpResponse WebApplication::handle_get_config(const std::string &method,
+                                                               const std::string &query,
+                                                               const std::string &body)
+{
+    std::string name = extract_parameter(query, "name");
+    if (name.empty() && method == "POST") {
+        auto params = parse_form_urlencoded(body);
+        auto it = params.find("name");
+        if (it != params.end()) {
+            name = it->second;
+        }
+    }
+
+    if (name.empty()) {
+        return respond_json(400, "{\"error\":\"Missing name parameter\"}");
+    }
+    if (!ConfigStore::is_valid_name(name)) {
+        return respond_json(400, "{\"error\":\"Invalid configuration name\"}");
+    }
+
+    try {
+        auto xml = config_store_.load_xml(name);
+        auto config = load_configuration_from_string(xml);
+        std::ostringstream stream;
+        stream << "{\"name\":\"" << json_escape(name) << "\",\"summary\":"
+               << build_config_summary_json(config) << ",\"xml\":\"" << json_escape(xml) << "\"}";
+        return respond_json(200, stream.str());
+    } catch (const std::exception &ex) {
+        return respond_json(404, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
+    }
+}
+
+WebApplication::HttpResponse WebApplication::handle_save_config(const std::string &body)
+{
+    auto params = parse_form_urlencoded(body);
+    auto name_it = params.find("name");
+    auto xml_it = params.find("xml");
+    if (name_it == params.end() || name_it->second.empty()) {
+        return respond_json(400, "{\"error\":\"Missing name parameter\"}");
+    }
+    if (xml_it == params.end() || xml_it->second.empty()) {
+        return respond_json(400, "{\"error\":\"Missing xml parameter\"}");
+    }
+
+    const std::string &name = name_it->second;
+    if (!ConfigStore::is_valid_name(name)) {
+        return respond_json(400, "{\"error\":\"Invalid configuration name\"}");
+    }
+
+    try {
+        auto config = load_configuration_from_string(xml_it->second);
+        (void)config;
+        bool replaced = config_store_.exists(name);
+        config_store_.save(name, xml_it->second);
+        std::ostringstream stream;
+        stream << "{\"message\":\"Configuration saved\",\"name\":\"" << json_escape(name)
+               << "\",\"replaced\":" << (replaced ? "true" : "false") << "}";
+        return respond_json(200, stream.str());
+    } catch (const std::exception &ex) {
+        return respond_json(400, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
+    }
+}
+
+WebApplication::HttpResponse WebApplication::handle_upload_config(const std::string &body)
+{
+    auto params = parse_form_urlencoded(body);
+    auto path_it = params.find("path");
+    if (path_it == params.end()) {
+        path_it = params.find("relativePath");
+    }
+    auto contents_it = params.find("contents");
+    if (contents_it == params.end()) {
+        contents_it = params.find("xml");
+    }
+
+    if (path_it == params.end() || path_it->second.empty()) {
+        return make_error_response(400, "Missing configuration path");
+    }
+    if (contents_it == params.end()) {
+        return make_error_response(400, "Missing configuration contents");
+    }
+
+    std::string success_message = "Configuration uploaded";
+    auto message_it = params.find("message");
+    if (message_it != params.end() && !message_it->second.empty()) {
+        success_message = message_it->second;
+    }
+
+    return write_config_file(path_it->second, contents_it->second, success_message);
 }
 
 bool WebApplication::start_simulator(const std::string &config_path, const std::string &config_label, std::string &message)
