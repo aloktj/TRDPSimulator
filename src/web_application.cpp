@@ -10,13 +10,13 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
-#include <vector>
+#include <utility>
 
 #include "trdp_simulator/config_loader.hpp"
+#include "trdp_simulator/logger.hpp"
 #include "trdp_simulator/simulator.hpp"
 #include "trdp_simulator/trdp_stack_adapter.hpp"
 
@@ -152,7 +152,9 @@ WebApplication::HttpResponse WebApplication::write_config_file(const std::string
 }
 
 WebApplication::WebApplication(std::string host, unsigned short port)
-    : host_(std::move(host)), port_(port)
+    : host_(std::move(host)),
+      port_(port),
+      config_store_(std::filesystem::path("config/library"))
 {
 }
 
@@ -337,11 +339,144 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
     }
 
     if (path == "/api/status") {
-        return {200, "OK", "application/json", build_status_json()};
+        return respond_json(200, build_status_json());
     }
 
     if (path == "/api/metrics") {
-        return {200, "OK", "application/json", build_metrics_json()};
+        return respond_json(200, build_metrics_json());
+    }
+
+    if (path == "/api/configs") {
+        std::ostringstream stream;
+        stream << "{\"configs\":[";
+        auto configs = config_store_.list();
+        for (std::size_t i = 0; i < configs.size(); ++i) {
+            if (i != 0) {
+                stream << ',';
+            }
+            stream << "{\"name\":\"" << json_escape(configs[i]) << "\"}";
+        }
+        stream << "]}";
+        return respond_json(200, stream.str());
+    }
+
+    if (path == "/api/config/parse" && method == "POST") {
+        auto params = parse_form_urlencoded(body);
+        auto xml_it = params.find("xml");
+        if (xml_it == params.end() || xml_it->second.empty()) {
+            return respond_json(400, "{\"error\":\"Missing xml parameter\"}");
+        }
+        try {
+            auto config = load_configuration_from_string(xml_it->second);
+            std::ostringstream stream;
+            stream << "{\"summary\":" << build_config_summary_json(config);
+            auto name_it = params.find("name");
+            if (name_it != params.end()) {
+                stream << ",\"suggestedName\":\"" << json_escape(name_it->second) << "\"";
+            }
+            stream << "}";
+            return respond_json(200, stream.str());
+        } catch (const std::exception &ex) {
+            return respond_json(400, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
+        }
+    }
+
+    if (path == "/api/config/save" && method == "POST") {
+        auto params = parse_form_urlencoded(body);
+        auto name_it = params.find("name");
+        auto xml_it = params.find("xml");
+        if (name_it == params.end() || name_it->second.empty()) {
+            return respond_json(400, "{\"error\":\"Missing name parameter\"}");
+        }
+        if (xml_it == params.end() || xml_it->second.empty()) {
+            return respond_json(400, "{\"error\":\"Missing xml parameter\"}");
+        }
+        const std::string &name = name_it->second;
+        if (!ConfigStore::is_valid_name(name)) {
+            return respond_json(400, "{\"error\":\"Invalid configuration name\"}");
+        }
+        try {
+            auto config = load_configuration_from_string(xml_it->second);
+            (void)config;
+            bool replaced = config_store_.exists(name);
+            config_store_.save(name, xml_it->second);
+            std::ostringstream stream;
+            stream << "{\"message\":\"Configuration saved\",\"name\":\"" << json_escape(name)
+                   << "\",\"replaced\":" << (replaced ? "true" : "false") << "}";
+            return respond_json(200, stream.str());
+        } catch (const std::exception &ex) {
+            return respond_json(400, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
+        }
+    }
+
+    if (path == "/api/config/details") {
+        std::string name = extract_parameter(query, "name");
+        if (name.empty() && method == "POST") {
+            auto params = parse_form_urlencoded(body);
+            auto it = params.find("name");
+            if (it != params.end()) {
+                name = it->second;
+            }
+        }
+        if (name.empty()) {
+            return respond_json(400, "{\"error\":\"Missing name parameter\"}");
+        }
+        if (!ConfigStore::is_valid_name(name)) {
+            return respond_json(400, "{\"error\":\"Invalid configuration name\"}");
+        }
+        try {
+            auto xml = config_store_.load_xml(name);
+            auto config = load_configuration_from_string(xml);
+            std::ostringstream stream;
+            stream << "{\"name\":\"" << json_escape(name) << "\",\"summary\":"
+                   << build_config_summary_json(config) << ",\"xml\":\"" << json_escape(xml) << "\"}";
+            return respond_json(200, stream.str());
+        } catch (const std::exception &ex) {
+            return respond_json(404, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
+        }
+    }
+
+    if (path == "/api/simulator/payloads") {
+        return respond_json(200, build_payloads_json());
+    }
+
+    if (path == "/api/simulator/payload" && method == "POST") {
+        auto params = parse_form_urlencoded(body);
+        const auto type_it = params.find("type");
+        const auto name_it = params.find("name");
+        const auto format_it = params.find("format");
+        const auto value_it = params.find("value");
+        if (type_it == params.end() || name_it == params.end() || format_it == params.end() || value_it == params.end()) {
+            return respond_json(400, "{\"error\":\"Missing required parameters\"}");
+        }
+
+        std::shared_ptr<Simulator> simulator;
+        {
+            std::lock_guard<std::mutex> lock(simulator_mutex_);
+            simulator = active_simulator_;
+        }
+        if (!simulator) {
+            return respond_json(409, "{\"error\":\"Simulator is not running\"}");
+        }
+
+        std::string error;
+        try {
+            const auto format = payload_format_from_string(format_it->second);
+            bool ok = false;
+            if (type_it->second == "pd") {
+                ok = simulator->set_pd_payload(name_it->second, format, value_it->second, error);
+            } else if (type_it->second == "md") {
+                ok = simulator->set_md_payload(name_it->second, format, value_it->second, error);
+            } else {
+                return respond_json(400, "{\"error\":\"Unsupported payload type\"}");
+            }
+            if (!ok) {
+                return respond_json(409, "{\"error\":\"" + json_escape(error) + "\"}");
+            }
+            return respond_json(200, "{\"message\":\"Payload updated\"}");
+        } catch (const std::exception &ex) {
+            return respond_json(400, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
+        }
     }
 
     if (path == "/api/config/list") {
@@ -361,154 +496,51 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
     }
 
     if (path == "/api/start") {
-        std::string config = extract_parameter(query, "config");
-        if (config.empty() && method == "POST") {
-            config = extract_parameter(body, "config");
+        std::string config_spec = extract_parameter(query, "config");
+        if (config_spec.empty() && method == "POST") {
+            config_spec = extract_parameter(body, "config");
         }
-        if (config.empty()) {
-            return {400, "Bad Request", "application/json",
-                    "{\"error\":\"Missing config parameter\"}"};
+        if (config_spec.empty()) {
+            return respond_json(400, "{\"error\":\"Missing config parameter\"}");
         }
+        std::string path_to_use = config_spec;
+        std::string label = config_spec;
+        if (config_spec.rfind("saved:", 0) == 0) {
+            std::string name = config_spec.substr(6);
+            if (!ConfigStore::is_valid_name(name) || !config_store_.exists(name)) {
+                return respond_json(404, "{\"error\":\"Saved configuration not found\"}");
+            }
+            path_to_use = config_store_.path_for(name).string();
+            label = name;
+        } else if (!std::filesystem::exists(path_to_use)) {
+            if (ConfigStore::is_valid_name(config_spec) && config_store_.exists(config_spec)) {
+                path_to_use = config_store_.path_for(config_spec).string();
+                label = config_spec;
+            }
+        }
+
         std::string message;
-        if (start_simulator(url_decode(config), message)) {
-            return {202, "Accepted", "application/json",
-                    "{\"message\":\"" + json_escape(message) + "\"}"};
+        if (start_simulator(path_to_use, label, message)) {
+            std::ostringstream stream;
+            stream << "{\"message\":\"" << json_escape(message) << "\",\"config\":\""
+                   << json_escape(label) << "\"}";
+            return respond_json(202, stream.str());
         }
-        return {409, "Conflict", "application/json",
-                "{\"error\":\"" + json_escape(message) + "\"}"};
+        return respond_json(409, "{\"error\":\"" + json_escape(message) + "\"}");
     }
 
     if (path == "/api/stop") {
         std::string message;
         if (stop_simulator(message)) {
-            return {200, "OK", "application/json",
-                    "{\"message\":\"" + json_escape(message) + "\"}"};
+            return respond_json(200, "{\"message\":\"" + json_escape(message) + "\"}");
         }
-        return {409, "Conflict", "application/json",
-                "{\"error\":\"" + json_escape(message) + "\"}"};
+        return respond_json(409, "{\"error\":\"" + json_escape(message) + "\"}");
     }
 
-    return {404, "Not Found", "application/json", "{\"error\":\"Not found\"}"};
+    return respond_json(404, "{\"error\":\"Not found\"}");
 }
 
-WebApplication::HttpResponse WebApplication::handle_get_config(const std::string &query) const
-{
-    std::string error;
-    if (!ensure_config_directory(error)) {
-        return make_error_response(500, error);
-    }
-
-    std::string path = url_decode(extract_parameter(query, "path"));
-    if (path.empty()) {
-        return make_error_response(400, "Missing path parameter");
-    }
-    if (!is_safe_config_relative_path(path)) {
-        return make_error_response(400, "Configuration path is not allowed");
-    }
-
-    std::filesystem::path full_path = resolved_config_root() / std::filesystem::path(path);
-    std::error_code ec;
-    bool exists = std::filesystem::exists(full_path, ec);
-    if (ec || !exists) {
-        return make_error_response(404, ec ? "Unable to access configuration file: " + ec.message()
-                                          : "Configuration file not found");
-    }
-    bool regular = std::filesystem::is_regular_file(full_path, ec);
-    if (ec || !regular) {
-        return make_error_response(404, ec ? "Unable to access configuration file: " + ec.message()
-                                          : "Configuration file not found");
-    }
-
-    auto size = std::filesystem::file_size(full_path, ec);
-    if (ec) {
-        return make_error_response(500, "Unable to read configuration file: " + ec.message());
-    }
-    if (size > kMaxConfigFileSize) {
-        return make_error_response(400, "Configuration exceeds size limit (512 KB)");
-    }
-
-    std::ifstream input(full_path, std::ios::binary);
-    if (!input) {
-        return make_error_response(500, "Unable to open configuration file");
-    }
-
-    std::ostringstream contents;
-    contents << input.rdbuf();
-    if (!input.good() && !input.eof()) {
-        return make_error_response(500, "Failed to read configuration file");
-    }
-
-    std::ostringstream body;
-    body << "{\"path\":\"" << json_escape(path) << "\",\"absolutePath\":\""
-         << json_escape(absolute_path_string(full_path)) << "\",\"contents\":\""
-         << json_escape(contents.str()) << "\"}";
-    return {200, "OK", "application/json", body.str()};
-}
-
-WebApplication::HttpResponse WebApplication::handle_list_configs() const
-{
-    std::string error;
-    if (!ensure_config_directory(error)) {
-        return make_error_response(500, error);
-    }
-
-    std::error_code ec;
-    std::vector<std::pair<std::string, std::string>> files;
-    for (std::filesystem::recursive_directory_iterator it(resolved_config_root(), ec), end;
-         it != end && !ec; ++it) {
-        if (!it->is_regular_file(ec) || ec) {
-            continue;
-        }
-        if (!it->path().has_extension()) {
-            continue;
-        }
-        if (!is_xml_file_name(it->path().filename().string())) {
-            continue;
-        }
-        std::filesystem::path rel = it->path().lexically_relative(resolved_config_root());
-        std::string rel_str = rel.generic_string();
-        if (!is_safe_config_relative_path(rel_str)) {
-            continue;
-        }
-        files.emplace_back(rel_str, absolute_path_string(it->path()));
-    }
-
-    if (ec) {
-        return make_error_response(500, "Unable to list configuration directory: " + ec.message());
-    }
-
-    std::sort(files.begin(), files.end(), [](const auto &lhs, const auto &rhs) {
-        return lhs.first < rhs.first;
-    });
-
-    std::ostringstream stream;
-    stream << "{\"files\":[";
-    for (std::size_t i = 0; i < files.size(); ++i) {
-        if (i != 0) {
-            stream << ',';
-        }
-        stream << "{\"path\":\"" << json_escape(files[i].first) << "\",\"absolutePath\":\""
-               << json_escape(files[i].second) << "\"}";
-    }
-    stream << "]}";
-    return {200, "OK", "application/json", stream.str()};
-}
-
-WebApplication::HttpResponse WebApplication::handle_save_config(const std::string &body) const
-{
-    std::string path = url_decode(extract_parameter(body, "path"));
-    std::string contents = url_decode(extract_parameter(body, "contents"));
-    return write_config_file(path, contents, "Saved configuration");
-}
-
-WebApplication::HttpResponse WebApplication::handle_upload_config(const std::string &body) const
-{
-    std::string file_name = url_decode(extract_parameter(body, "fileName"));
-    std::string contents = url_decode(extract_parameter(body, "contents"));
-    return write_config_file(file_name, contents, "Uploaded configuration");
-}
-
-bool WebApplication::start_simulator(const std::string &config_path, std::string &message)
+bool WebApplication::start_simulator(const std::string &config_path, const std::string &config_label, std::string &message)
 {
     std::unique_lock<std::mutex> lock(simulator_mutex_);
     if (simulator_running_ || simulator_start_pending_) {
@@ -525,6 +557,8 @@ bool WebApplication::start_simulator(const std::string &config_path, std::string
     simulator_start_pending_ = true;
     last_error_.reset();
     current_config_.clear();
+    current_config_label_.clear();
+    pending_config_label_ = config_label;
     has_metrics_snapshot_ = false;
     last_metrics_snapshot_ = RuntimeMetrics::Snapshot{};
 
@@ -537,6 +571,7 @@ bool WebApplication::start_simulator(const std::string &config_path, std::string
         return true;
     }
 
+    pending_config_label_.clear();
     message = last_error_.value_or("Failed to start simulator");
     return false;
 }
@@ -576,6 +611,8 @@ bool WebApplication::stop_simulator(std::string &message)
         simulator_start_pending_ = false;
         active_simulator_.reset();
         current_config_.clear();
+        current_config_label_.clear();
+        pending_config_label_.clear();
         message = "Simulator stopped";
         last_error_.reset();
         if (have_snapshot) {
@@ -596,6 +633,9 @@ std::string WebApplication::build_status_json() const
     stream << "\"running\":" << (simulator_running_ ? "true" : "false");
     if (!current_config_.empty()) {
         stream << ",\"config\":\"" << json_escape(current_config_) << "\"";
+    }
+    if (!current_config_label_.empty()) {
+        stream << ",\"configLabel\":\"" << json_escape(current_config_label_) << "\"";
     }
     if (last_error_.has_value()) {
         stream << ",\"lastError\":\"" << json_escape(*last_error_) << "\"";
@@ -684,6 +724,171 @@ std::string WebApplication::build_metrics_json() const
     return stream.str();
 }
 
+std::string WebApplication::build_config_summary_json(const SimulatorConfig &config) const
+{
+    std::ostringstream stream;
+    stream << "{";
+    stream << "\"network\":{\"interface\":\"" << json_escape(config.network.interfaceName) << "\"";
+    if (!config.network.hostIp.empty()) {
+        stream << ",\"hostIp\":\"" << json_escape(config.network.hostIp) << "\"";
+    }
+    if (!config.network.gatewayIp.empty()) {
+        stream << ",\"gateway\":\"" << json_escape(config.network.gatewayIp) << "\"";
+    }
+    stream << ",\"vlanId\":" << config.network.vlanId;
+    stream << ",\"ttl\":" << static_cast<unsigned int>(config.network.ttl) << "}";
+
+    stream << ",\"logging\":{\"console\":" << (config.logging.enableConsole ? "true" : "false")
+           << ",\"level\":\"" << json_escape(log_level_to_string(config.logging.level)) << "\"";
+    if (!config.logging.filePath.empty()) {
+        stream << ",\"file\":\"" << json_escape(config.logging.filePath) << "\"";
+    }
+    stream << "}";
+
+    auto serialize_payload = [](const PayloadConfig &payload) {
+        std::ostringstream s;
+        s << "\"format\":\"" << WebApplication::json_escape(payload_format_to_string(payload.format)) << "\"";
+        s << ",\"value\":\"" << WebApplication::json_escape(payload.value) << "\"";
+        return s.str();
+    };
+
+    stream << ",\"pdPublishers\":[";
+    for (std::size_t i = 0; i < config.pdPublishers.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &publisher = config.pdPublishers[i];
+        stream << "{\"name\":\"" << json_escape(publisher.name) << "\",\"comId\":" << publisher.comId
+               << ",\"datasetId\":" << publisher.datasetId
+               << ",\"cycleTimeMs\":" << publisher.cycleTimeMs
+               << ",\"payload\":{" << serialize_payload(publisher.payload) << "}}";
+    }
+    stream << "]";
+
+    stream << ",\"pdSubscribers\":[";
+    for (std::size_t i = 0; i < config.pdSubscribers.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &subscriber = config.pdSubscribers[i];
+        stream << "{\"name\":\"" << json_escape(subscriber.name) << "\",\"comId\":" << subscriber.comId
+               << ",\"timeoutMs\":" << subscriber.timeoutMs << "}";
+    }
+    stream << "]";
+
+    stream << ",\"mdSenders\":[";
+    for (std::size_t i = 0; i < config.mdSenders.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &sender = config.mdSenders[i];
+        stream << "{\"name\":\"" << json_escape(sender.name) << "\",\"comId\":" << sender.comId
+               << ",\"cycleTimeMs\":" << sender.cycleTimeMs
+               << ",\"payload\":{" << serialize_payload(sender.payload) << "}}";
+    }
+    stream << "]";
+
+    stream << ",\"mdListeners\":[";
+    for (std::size_t i = 0; i < config.mdListeners.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        const auto &listener = config.mdListeners[i];
+        stream << "{\"name\":\"" << json_escape(listener.name) << "\",\"comId\":" << listener.comId
+               << ",\"autoReply\":" << (listener.autoReply ? "true" : "false");
+        if (!listener.replyPayload.value.empty()) {
+            stream << ",\"replyPayload\":{" << serialize_payload(listener.replyPayload) << "}";
+        }
+        stream << "}";
+    }
+    stream << "]";
+
+    stream << "}";
+    return stream.str();
+}
+
+std::string WebApplication::build_payloads_json() const
+{
+    std::shared_ptr<Simulator> simulator;
+    bool running = false;
+    {
+        std::lock_guard<std::mutex> lock(simulator_mutex_);
+        simulator = active_simulator_;
+        running = simulator_running_;
+    }
+
+    SimulatorConfig config;
+    bool have_config = false;
+    if (simulator) {
+        config = simulator->current_config();
+        have_config = true;
+    } else if (!current_config_.empty()) {
+        try {
+            config = load_configuration(current_config_);
+            have_config = true;
+        } catch (...) {
+        }
+    }
+
+    std::ostringstream stream;
+    stream << "{\"running\":" << (running ? "true" : "false") << ",\"pd\":[";
+    if (have_config) {
+        for (std::size_t i = 0; i < config.pdPublishers.size(); ++i) {
+            if (i != 0) {
+                stream << ',';
+            }
+            const auto &publisher = config.pdPublishers[i];
+            const bool editable = publisher.payload.format != PayloadConfig::Format::File;
+            stream << "{\"name\":\"" << json_escape(publisher.name) << "\",\"format\":\""
+                   << json_escape(payload_format_to_string(publisher.payload.format)) << "\",\"value\":\""
+                   << json_escape(publisher.payload.value) << "\",\"editable\":"
+                   << (editable ? "true" : "false") << "}";
+        }
+    }
+    stream << "],\"md\":[";
+    if (have_config) {
+        for (std::size_t i = 0; i < config.mdSenders.size(); ++i) {
+            if (i != 0) {
+                stream << ',';
+            }
+            const auto &sender = config.mdSenders[i];
+            const bool editable = sender.payload.format != PayloadConfig::Format::File;
+            stream << "{\"name\":\"" << json_escape(sender.name) << "\",\"format\":\""
+                   << json_escape(payload_format_to_string(sender.payload.format)) << "\",\"value\":\""
+                   << json_escape(sender.payload.value) << "\",\"editable\":"
+                   << (editable ? "true" : "false") << "}";
+        }
+    }
+    stream << "]}";
+    return stream.str();
+}
+
+std::unordered_map<std::string, std::string> WebApplication::parse_form_urlencoded(const std::string &body) const
+{
+    std::unordered_map<std::string, std::string> params;
+    std::size_t pos = 0;
+    while (pos < body.size()) {
+        auto amp = body.find('&', pos);
+        auto token = body.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        auto eq = token.find('=');
+        std::string key = url_decode(eq == std::string::npos ? token : token.substr(0, eq));
+        std::string value = eq == std::string::npos ? std::string() : url_decode(token.substr(eq + 1));
+        if (!key.empty()) {
+            params[key] = value;
+        }
+        if (amp == std::string::npos) {
+            break;
+        }
+        pos = amp + 1;
+    }
+    return params;
+}
+
+WebApplication::HttpResponse WebApplication::respond_json(int status, const std::string &body) const
+{
+    return {status, std::string(), "application/json", body};
+}
+
 void WebApplication::request_stop()
 {
     stop_requested_.store(true);
@@ -712,6 +917,12 @@ void WebApplication::simulator_worker(std::string config_path)
             simulator_running_ = true;
             simulator_start_pending_ = false;
             current_config_ = config_path;
+            if (!pending_config_label_.empty()) {
+                current_config_label_ = pending_config_label_;
+            } else {
+                current_config_label_ = config_path;
+            }
+            pending_config_label_.clear();
             last_error_.reset();
             simulator_cv_.notify_all();
         }
@@ -748,6 +959,8 @@ void WebApplication::simulator_worker(std::string config_path)
             simulator_start_pending_ = false;
             active_simulator_.reset();
             current_config_.clear();
+            current_config_label_.clear();
+            pending_config_label_.clear();
             if (have_snapshot) {
                 last_metrics_snapshot_ = snapshot;
                 has_metrics_snapshot_ = true;
@@ -765,18 +978,20 @@ std::string WebApplication::main_page_html()
 <meta charset="utf-8" />
 <title>TRDP Simulator Web</title>
 <style>
-body { font-family: sans-serif; margin: 2rem; background: #f6f8fa; color: #1f2328; }
-main { max-width: 780px; margin: 0 auto; padding: 2rem; background: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(31,35,40,0.1); }
-header { margin-bottom: 1.5rem; }
-label { display: block; margin-bottom: 0.5rem; font-weight: 600; }
-input[type="text"] { width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #d0d7de; border-radius: 4px; }
-select { width: 100%; padding: 0.5rem; border: 1px solid #d0d7de; border-radius: 4px; background: #ffffff; }
-textarea { width: 100%; min-height: 260px; padding: 0.75rem; border: 1px solid #d0d7de; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.9rem; line-height: 1.4; }
-button { padding: 0.5rem 1rem; margin-right: 0.5rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
+body { font-family: "Segoe UI", sans-serif; margin: 2rem; background: #f6f8fa; color: #1f2328; }
+main { max-width: 960px; margin: 0 auto; padding: 2rem; background: #ffffff; border-radius: 12px; box-shadow: 0 2px 10px rgba(31,35,40,0.08); }
+header { margin-bottom: 2rem; }
+label { display: block; margin-bottom: 0.35rem; font-weight: 600; }
+input[type="text"], select, textarea { width: 100%; padding: 0.6rem; border: 1px solid #d0d7de; border-radius: 6px; font-size: 0.95rem; }
+textarea { min-height: 80px; resize: vertical; font-family: monospace; }
+button { padding: 0.55rem 1.1rem; margin: 0.25rem 0.25rem 0.25rem 0; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
 button.start { background: #238636; color: #ffffff; }
 button.stop { background: #d1242f; color: #ffffff; }
-section { margin-top: 1.5rem; }
-pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; border: 1px solid #d0d7de; }
+button.secondary { background: #0969da; color: #ffffff; }
+button[disabled] { opacity: 0.6; cursor: not-allowed; }
+section { margin-top: 2rem; }
+section:first-of-type { margin-top: 0; }
+pre { background: #f6f8fa; padding: 1rem; border-radius: 6px; overflow: auto; border: 1px solid #d0d7de; font-size: 0.9rem; }
 #status { font-weight: 600; }
 .control-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
 .control-row button { margin-right: 0; }
@@ -792,75 +1007,136 @@ pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; bo
 .notice.muted { color: #57606a; font-style: italic; }
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
 .metrics-grid h3 { margin-top: 0; font-size: 1.05rem; }
-.metrics-grid ul { list-style: none; padding: 0.75rem; margin: 0; background: #f6f8fa; border-radius: 4px; border: 1px solid #d0d7de; }
+.metrics-grid ul { list-style: none; padding: 0.75rem; margin: 0; background: #f6f8fa; border-radius: 6px; border: 1px solid #d0d7de; }
 .metrics-grid li { margin-bottom: 0.5rem; font-size: 0.95rem; }
 .metrics-grid li:last-child { margin-bottom: 0; }
 .metrics-grid li.muted { color: #57606a; font-style: italic; }
+.drop-zone { border: 2px dashed #0969da; padding: 1.5rem; border-radius: 8px; text-align: center; color: #0969da; background: rgba(9,105,218,0.05); transition: background 0.2s ease, border-color 0.2s ease; }
+.drop-zone.dragover { background: rgba(9,105,218,0.12); border-color: #0550ae; }
+.inline-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
+.hidden { display: none !important; }
+#messages { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; display: none; }
+#messages.info { background: #e7f3ff; border: 1px solid #b6daff; color: #054289; }
+#messages.error { background: #ffebe9; border: 1px solid #ff8182; color: #b54746; }
+#messages.success { background: #dafbe1; border: 1px solid #4ac26b; color: #116329; }
+.payload-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.payload-card { border: 1px solid #d0d7de; border-radius: 8px; padding: 1rem; background: #f8fafc; display: flex; flex-direction: column; gap: 0.75rem; }
+.payload-card h4 { margin: 0; font-size: 1rem; }
+.payload-meta { font-size: 0.85rem; color: #57606a; }
+.payload-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
 </style>
 </head>
 <body>
 <main>
 <header>
-<h1>TRDP Simulator Web Interface</h1>
-<p>Start and stop the simulator from your browser. Provide the path to a configuration XML file accessible on the host.</p>
+  <h1>TRDP Simulator Web Interface</h1>
+  <p>Upload TRDP configuration XML files, review their contents, store them for later use, and control the simulator directly from your browser.</p>
 </header>
-<label for="configPath">Configuration file</label>
-<input id="configPath" type="text" placeholder="/path/to/configuration.xml" />
-<div class="control-row">
-<button class="start" id="startBtn">Start simulator</button>
-<button class="stop" id="stopBtn">Stop simulator</button>
-</div>
-<section>
-<h2>Status</h2>
-<p id="status">Loading...</p>
-<p><strong>Simulator:</strong> <span id="simulatorState">Unknown</span></p>
-<pre id="details"></pre>
+
+<div id="messages"></div>
+
+<section id="uploadSection">
+  <h2>Upload configuration</h2>
+  <div class="drop-zone" id="dropZone">Drop a TRDP XML file here or <strong>click to browse</strong>.<br /><small>Only the XML content is uploaded to the server for validation.</small></div>
+  <input id="configFile" type="file" accept=".xml" style="display:none" />
+  <div class="inline-actions">
+    <div><strong>Parsed file:</strong> <span id="parsedConfigName">None</span></div>
+    <button class="secondary" id="saveConfigBtn" disabled>Save configuration</button>
+  </div>
+  <pre id="configSummary">Drop a configuration to preview its details.</pre>
 </section>
-<section>
-<h2>Configuration editor</h2>
-<p>Manage XML files stored under <code>config/</code>. Load, edit, save, or upload new configurations without leaving the dashboard.</p>
-<label for="configSelect">Available configurations</label>
-<div class="config-controls">
-<select id="configSelect"></select>
-<button id="loadConfigBtn" type="button">Load</button>
-<button id="useConfigBtn" type="button">Use for start</button>
-</div>
-<label for="configEditorPath">File name (relative to <code>config/</code>)</label>
-<input id="configEditorPath" type="text" placeholder="example_configuration.xml" />
-<label for="configEditorContents">Contents</label>
-<textarea id="configEditorContents" placeholder="&lt;trdpSimulator&gt;&#10;  ...&#10;&lt;/trdpSimulator&gt;"></textarea>
-<div class="config-actions">
-<button id="saveConfigBtn" type="button">Save changes</button>
-<input id="configUpload" type="file" accept=".xml" />
-<button id="uploadConfigBtn" type="button">Upload file</button>
-</div>
-<p id="configMessage" class="notice muted"></p>
+
+<section id="savedConfigsSection">
+  <h2>Saved configurations</h2>
+  <div class="inline-actions">
+    <div style="flex:1; min-width: 240px;">
+      <label for="configSelect">Select a saved configuration</label>
+      <select id="configSelect"></select>
+    </div>
+    <button class="secondary" id="viewConfigBtn">View details</button>
+  </div>
+  <pre id="savedConfigDetails">No configuration selected.</pre>
 </section>
-<section>
-<h2>Telemetry</h2>
-<p><strong>Adapter:</strong> <span id="adapterState">Idle</span></p>
-<div class="metrics-grid">
+
+<section id="controlSection">
+  <h2>Simulator control</h2>
+  <p>Choose a saved configuration or provide a manual file path. Saved configurations are referenced as <code>saved:&lt;name&gt;</code> when starting the simulator.</p>
+  <label for="configPath">Manual configuration path (optional)</label>
+  <input id="configPath" type="text" placeholder="/path/to/configuration.xml" />
   <div>
-    <h3>PD Publishers</h3>
-    <ul id="pdPublishersList"><li class="muted">No data</li></ul>
+    <button class="start" id="startBtn">Start simulator</button>
+    <button class="stop" id="stopBtn">Stop simulator</button>
+  </div>
+  <section>
+    <h3>Status</h3>
+    <p id="status">Loading...</p>
+    <p><strong>Simulator:</strong> <span id="simulatorState">Unknown</span></p>
+    <pre id="details"></pre>
+  </section>
+</section>
+
+<section id="payloadEditor" class="hidden">
+  <h2>Live payload editor</h2>
+  <p>Update PD publisher and MD sender payloads while the simulator is running. Hex payloads should be entered without prefixes (spaces are ignored).</p>
+  <div>
+    <h3>Process Data publishers</h3>
+    <div id="pdPayloads" class="payload-grid"></div>
   </div>
   <div>
-    <h3>PD Subscribers</h3>
-    <ul id="pdSubscribersList"><li class="muted">No data</li></ul>
+    <h3>Message Data senders</h3>
+    <div id="mdPayloads" class="payload-grid"></div>
   </div>
-  <div>
-    <h3>MD Senders</h3>
-    <ul id="mdSendersList"><li class="muted">No data</li></ul>
+</section>
+
+<section id="telemetrySection">
+  <h2>Telemetry</h2>
+  <p><strong>Adapter:</strong> <span id="adapterState">Idle</span></p>
+  <div class="metrics-grid">
+    <div>
+      <h3>PD Publishers</h3>
+      <ul id="pdPublishersList"><li class="muted">No data</li></ul>
+    </div>
+    <div>
+      <h3>PD Subscribers</h3>
+      <ul id="pdSubscribersList"><li class="muted">No data</li></ul>
+    </div>
+    <div>
+      <h3>MD Senders</h3>
+      <ul id="mdSendersList"><li class="muted">No data</li></ul>
+    </div>
+    <div>
+      <h3>MD Listeners</h3>
+      <ul id="mdListenersList"><li class="muted">No data</li></ul>
+    </div>
   </div>
-  <div>
-    <h3>MD Listeners</h3>
-    <ul id="mdListenersList"><li class="muted">No data</li></ul>
-  </div>
-</div>
-<pre id="metricsRaw"></pre>
+  <pre id="metricsRaw"></pre>
 </section>
 </main>
 <script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('configFile');
+const configSummaryPre = document.getElementById('configSummary');
+const parsedConfigName = document.getElementById('parsedConfigName');
+const saveConfigBtn = document.getElementById('saveConfigBtn');
+const messageBox = document.getElementById('messages');
+const configSelect = document.getElementById('configSelect');
+const savedConfigDetails = document.getElementById('savedConfigDetails');
+let lastParsedXml = '';
+let lastSuggestedName = '';
+
+function showMessage(text, variant = 'info') {
+  if (!text) {
+    messageBox.style.display = 'none';
+    return;
+  }
+  messageBox.textContent = text;
+  messageBox.className = variant;
+  messageBox.style.display = 'block';
+  if (variant === 'success') {
+    setTimeout(() => { messageBox.style.display = 'none'; }, 4000);
+  }
+}
+
 function renderMetricList(elementId, items, formatter, emptyMessage) {
   const list = document.getElementById(elementId);
   if (!list) {
@@ -882,201 +1158,218 @@ function renderMetricList(elementId, items, formatter, emptyMessage) {
   });
 }
 
-let lastLoadedConfig = null;
-
-function setConfigMessage(message, type = 'info') {
-  const element = document.getElementById('configMessage');
-  if (!element) {
-    return;
-  }
-  element.textContent = message || '';
-  element.classList.remove('success', 'error', 'muted');
-  if (!message) {
-    element.classList.add('muted');
-    return;
-  }
-  if (type === 'success') {
-    element.classList.add('success');
-  } else if (type === 'error') {
-    element.classList.add('error');
-  } else {
-    element.classList.add('muted');
-  }
+function preventDefaults(event) {
+  event.preventDefault();
+  event.stopPropagation();
 }
 
-async function loadConfigList(selectedPath = null) {
-  const select = document.getElementById('configSelect');
-  if (!select) {
+function highlightDropZone() { dropZone.classList.add('dragover'); }
+function unhighlightDropZone() { dropZone.classList.remove('dragover'); }
+
+dropZone.addEventListener('click', () => fileInput.click());
+['dragenter', 'dragover'].forEach((eventName) => {
+  dropZone.addEventListener(eventName, (event) => { preventDefaults(event); highlightDropZone(); });
+});
+['dragleave', 'drop'].forEach((eventName) => {
+  dropZone.addEventListener(eventName, (event) => { preventDefaults(event); unhighlightDropZone(); });
+});
+
+dropZone.addEventListener('drop', (event) => {
+  const files = event.dataTransfer.files;
+  if (files && files.length > 0) {
+    readConfigurationFile(files[0]);
+  }
+});
+
+fileInput.addEventListener('change', (event) => {
+  const files = event.target.files;
+  if (files && files.length > 0) {
+    readConfigurationFile(files[0]);
+  }
+});
+
+function readConfigurationFile(file) {
+  if (!file.name.toLowerCase().endsWith('.xml')) {
+    showMessage('Please select an XML configuration file.', 'error');
     return;
   }
-  const previous = selectedPath || select.dataset.selected || '';
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const xmlText = reader.result;
+    await parseUploadedConfiguration(xmlText, file.name.replace(/\.[^.]+$/, ''));
+  };
+  reader.readAsText(file);
+}
+
+async function parseUploadedConfiguration(xmlText, suggestedName = '') {
   try {
-    const response = await fetch('/api/config/list');
-    if (!response.ok) {
-      throw new Error('Request failed');
+    const params = new URLSearchParams();
+    params.set('xml', xmlText);
+    if (suggestedName) {
+      params.set('name', suggestedName);
     }
+    const response = await fetch('/api/config/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params,
+    });
     const data = await response.json();
-    const files = Array.isArray(data.files) ? data.files : [];
-    select.innerHTML = '';
-    if (files.length === 0) {
-      const option = document.createElement('option');
-      option.textContent = 'No configurations found';
-      option.value = '';
-      option.disabled = true;
-      select.appendChild(option);
-      select.dataset.selected = '';
+    if (!response.ok) {
+      showMessage(data.error || 'Failed to parse configuration.', 'error');
+      configSummaryPre.textContent = data.error || 'Unable to parse configuration.';
+      saveConfigBtn.disabled = true;
       return;
     }
-    files.forEach((file) => {
-      const option = document.createElement('option');
-      option.value = file.path;
-      option.textContent = file.path;
-      if (file.absolutePath) {
-        option.dataset.absolutePath = file.absolutePath;
-      }
-      select.appendChild(option);
-    });
-    const target = files.some((file) => file.path === previous) ? previous : files[0].path;
-    select.value = target;
-    select.dataset.selected = select.value;
-  } catch (err) {
-    select.innerHTML = '';
-    const option = document.createElement('option');
-    option.textContent = 'Unable to load configurations';
-    option.value = '';
-    option.disabled = true;
-    select.appendChild(option);
-    select.dataset.selected = '';
-    setConfigMessage('Unable to load configuration list.', 'error');
+    lastParsedXml = xmlText;
+    lastSuggestedName = (suggestedName || data.suggestedName || '').replace(/\s+/g, '_');
+    parsedConfigName.textContent = lastSuggestedName || '(unspecified)';
+    configSummaryPre.textContent = JSON.stringify(data.summary, null, 2);
+    saveConfigBtn.disabled = false;
+    showMessage('Configuration parsed successfully.', 'success');
+  } catch (error) {
+    showMessage('Failed to parse configuration: ' + error.message, 'error');
   }
 }
 
-async function fetchConfiguration(path) {
-  try {
-    const response = await fetch('/api/config?path=' + encodeURIComponent(path));
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.error || 'Request failed');
-    }
-    const data = await response.json();
-    document.getElementById('configEditorPath').value = data.path || path;
-    document.getElementById('configEditorContents').value = data.contents || '';
-    if (data.absolutePath) {
-      document.getElementById('configPath').value = data.absolutePath;
-    }
-    lastLoadedConfig = data;
-    setConfigMessage(`Loaded ${data.path || path}.`, 'success');
-    await loadConfigList(data.path);
-  } catch (err) {
-    setConfigMessage(err.message || 'Unable to load configuration.', 'error');
-  }
-}
-
-async function saveConfiguration() {
-  const pathInput = document.getElementById('configEditorPath');
-  const contentsInput = document.getElementById('configEditorContents');
-  const path = pathInput.value.trim();
-  if (!path) {
-    setConfigMessage('Enter a file name before saving.', 'error');
+saveConfigBtn.addEventListener('click', async () => {
+  if (!lastParsedXml) {
     return;
   }
-  const body = 'path=' + encodeURIComponent(path) + '&contents=' + encodeURIComponent(contentsInput.value);
+  let name = prompt('Enter a name for the configuration', lastSuggestedName || 'trdp-config');
+  if (!name) {
+    return;
+  }
+  name = name.trim();
   try {
+    const params = new URLSearchParams();
+    params.set('name', name);
+    params.set('xml', lastParsedXml);
     const response = await fetch('/api/config/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
+      body: params,
     });
     const data = await response.json();
     if (!response.ok) {
-      throw new Error(data.error || 'Unable to save configuration.');
+      showMessage(data.error || 'Unable to save configuration.', 'error');
+      return;
     }
-    pathInput.value = data.path || path;
-    if (data.absolutePath) {
-      document.getElementById('configPath').value = data.absolutePath;
+    showMessage(`Configuration "${data.name}" saved successfully.`, 'success');
+    await refreshSavedConfigs();
+    configSelect.value = data.name;
+    await loadSelectedConfiguration();
+  } catch (error) {
+    showMessage('Saving configuration failed: ' + error.message, 'error');
+  }
+});
+
+document.getElementById('viewConfigBtn').addEventListener('click', loadSelectedConfiguration);
+
+async function refreshSavedConfigs() {
+  try {
+    const response = await fetch('/api/configs');
+    const data = await response.json();
+    configSelect.innerHTML = '';
+    if (!data.configs || data.configs.length === 0) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = 'No saved configurations';
+      option.disabled = true;
+      option.selected = true;
+      configSelect.appendChild(option);
+      savedConfigDetails.textContent = 'No configuration selected.';
+      return;
     }
-    lastLoadedConfig = data;
-    setConfigMessage(data.message || 'Configuration saved.', 'success');
-    await loadConfigList(data.path);
-  } catch (err) {
-    setConfigMessage(err.message || 'Unable to save configuration.', 'error');
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'Select a configuration';
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    configSelect.appendChild(placeholder);
+    data.configs.forEach((item) => {
+      const option = document.createElement('option');
+      option.value = item.name;
+      option.textContent = item.name;
+      configSelect.appendChild(option);
+    });
+  } catch (error) {
+    showMessage('Unable to fetch saved configurations: ' + error.message, 'error');
   }
 }
 
-async function uploadConfiguration() {
-  const fileInput = document.getElementById('configUpload');
-  if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
-    setConfigMessage('Select an XML file to upload.', 'error');
-    return;
-  }
-  const file = fileInput.files[0];
-  if (file.size > 524288) {
-    setConfigMessage('Selected file is larger than 512 KB.', 'error');
+async function loadSelectedConfiguration() {
+  const name = configSelect.value;
+  if (!name) {
+    savedConfigDetails.textContent = 'No configuration selected.';
     return;
   }
   try {
-    const contents = await file.text();
-    const body = 'fileName=' + encodeURIComponent(file.name) + '&contents=' + encodeURIComponent(contents);
-    const response = await fetch('/api/config/upload', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
+    const response = await fetch(`/api/config/details?name=${encodeURIComponent(name)}`);
     const data = await response.json();
     if (!response.ok) {
-      throw new Error(data.error || 'Unable to upload configuration.');
+      showMessage(data.error || 'Unable to load configuration details.', 'error');
+      return;
     }
-    document.getElementById('configEditorPath').value = data.path || file.name;
-    document.getElementById('configEditorContents').value = contents;
-    if (data.absolutePath) {
-      document.getElementById('configPath').value = data.absolutePath;
-    }
-    fileInput.value = '';
-    lastLoadedConfig = data;
-    setConfigMessage(data.message || 'Configuration uploaded.', 'success');
-    await loadConfigList(data.path);
-  } catch (err) {
-    setConfigMessage(err.message || 'Unable to upload configuration.', 'error');
+    savedConfigDetails.textContent = JSON.stringify(data.summary, null, 2);
+  } catch (error) {
+    showMessage('Unable to load configuration details: ' + error.message, 'error');
   }
 }
 
-document.getElementById('loadConfigBtn').addEventListener('click', async () => {
-  const select = document.getElementById('configSelect');
-  if (!select || !select.value) {
-    setConfigMessage('Select a configuration to load.', 'error');
+async function startSimulator() {
+  const manualPath = document.getElementById('configPath').value.trim();
+  const savedName = configSelect.value;
+  let configSpec = '';
+  if (manualPath) {
+    configSpec = manualPath;
+  } else if (savedName) {
+    configSpec = `saved:${savedName}`;
+  }
+  if (!configSpec) {
+    showMessage('Please choose a saved configuration or provide a path before starting the simulator.', 'error');
     return;
   }
-  await fetchConfiguration(select.value);
-});
+  try {
+    const params = new URLSearchParams();
+    params.set('config', configSpec);
+    const response = await fetch('/api/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      showMessage(data.error || 'Failed to start simulator.', 'error');
+      return;
+    }
+    showMessage(data.message || 'Simulator started.', 'success');
+    refreshStatus();
+    refreshMetrics();
+    refreshPayloads();
+  } catch (error) {
+    showMessage('Failed to start simulator: ' + error.message, 'error');
+  }
+}
 
-document.getElementById('useConfigBtn').addEventListener('click', () => {
-  const startInput = document.getElementById('configPath');
-  if (!startInput) {
-    return;
+async function stopSimulator() {
+  try {
+    const response = await fetch('/api/stop', { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok) {
+      showMessage(data.error || 'Failed to stop simulator.', 'error');
+      return;
+    }
+    showMessage(data.message || 'Simulator stopped.', 'success');
+    refreshStatus();
+    refreshMetrics();
+    refreshPayloads();
+  } catch (error) {
+    showMessage('Failed to stop simulator: ' + error.message, 'error');
   }
-  if (lastLoadedConfig && lastLoadedConfig.absolutePath) {
-    startInput.value = lastLoadedConfig.absolutePath;
-    setConfigMessage('Configuration path copied to start field.', 'success');
-    return;
-  }
-  const select = document.getElementById('configSelect');
-  const option = select && select.selectedOptions && select.selectedOptions[0] ? select.selectedOptions[0] : null;
-  if (option && option.dataset.absolutePath) {
-    startInput.value = option.dataset.absolutePath;
-    setConfigMessage('Configuration path copied to start field.', 'success');
-    return;
-  }
-  const relative = document.getElementById('configEditorPath').value.trim();
-  if (!relative) {
-    setConfigMessage('Load or enter a configuration file name first.', 'error');
-    return;
-  }
-  startInput.value = 'config/' + relative;
-  setConfigMessage('Using config/' + relative + ' for simulator start.', 'success');
-});
+}
 
-document.getElementById('saveConfigBtn').addEventListener('click', saveConfiguration);
-document.getElementById('uploadConfigBtn').addEventListener('click', uploadConfiguration);
+document.getElementById('startBtn').addEventListener('click', startSimulator);
+document.getElementById('stopBtn').addEventListener('click', stopSimulator);
 
 async function refreshStatus() {
   try {
@@ -1086,17 +1379,29 @@ async function refreshStatus() {
     const details = document.getElementById('details');
     const simulatorState = document.getElementById('simulatorState');
     if (data.running) {
-      status.textContent = 'Simulator is running';
+      status.textContent = `Simulator is running${data.configLabel ? ' with ' + data.configLabel : ''}.`;
       simulatorState.textContent = 'Running';
     } else {
       status.textContent = 'Simulator is stopped';
       simulatorState.textContent = 'Stopped';
     }
     details.textContent = JSON.stringify(data, null, 2);
+    if (data.running) {
+      refreshPayloads();
+    } else {
+      hidePayloadEditor();
+    }
   } catch (err) {
     document.getElementById('status').textContent = 'Unable to query status';
     document.getElementById('simulatorState').textContent = 'Unknown';
+    hidePayloadEditor();
   }
+}
+
+function hidePayloadEditor() {
+  document.getElementById('payloadEditor').classList.add('hidden');
+  document.getElementById('pdPayloads').innerHTML = '';
+  document.getElementById('mdPayloads').innerHTML = '';
 }
 
 async function refreshMetrics() {
@@ -1117,51 +1422,98 @@ async function refreshMetrics() {
       (item) => `${item.name}: ${item.requestsReceived} requests / ${item.repliesSent} replies`, 'No MD listeners');
     document.getElementById('metricsRaw').textContent = JSON.stringify(data, null, 2);
   } catch (err) {
-    document.getElementById('adapterState').textContent = 'Unavailable';
-    renderMetricList('pdPublishersList', [], () => '', 'No data available');
-    renderMetricList('pdSubscribersList', [], () => '', 'No data available');
-    renderMetricList('mdSendersList', [], () => '', 'No data available');
-    renderMetricList('mdListenersList', [], () => '', 'No data available');
     document.getElementById('metricsRaw').textContent = 'Unable to query metrics';
   }
 }
 
-document.getElementById('startBtn').addEventListener('click', async () => {
-  const configPath = document.getElementById('configPath').value.trim();
-  if (!configPath) {
-    alert('Enter the full path to a configuration file.');
+async function refreshPayloads() {
+  try {
+    const response = await fetch('/api/simulator/payloads');
+    if (!response.ok) {
+      throw new Error('Unable to fetch payloads');
+    }
+    const data = await response.json();
+    const editorSection = document.getElementById('payloadEditor');
+    if (!data.running) {
+      hidePayloadEditor();
+      return;
+    }
+    editorSection.classList.remove('hidden');
+    renderPayloadCards('pdPayloads', data.pd || [], 'pd');
+    renderPayloadCards('mdPayloads', data.md || [], 'md');
+  } catch (error) {
+    showMessage('Unable to refresh payload information: ' + error.message, 'error');
+  }
+}
+
+function renderPayloadCards(containerId, items, type) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+  if (!items || items.length === 0) {
+    const placeholder = document.createElement('div');
+    placeholder.textContent = 'No entries available.';
+    placeholder.classList.add('payload-meta');
+    container.appendChild(placeholder);
     return;
   }
-  const response = await fetch('/api/start?config=' + encodeURIComponent(configPath), { method: 'POST' });
-  const data = await response.json();
-  if (response.ok || response.status === 202) {
-    alert(data.message || 'Simulator starting');
-  } else {
-    alert(data.error || 'Unable to start simulator');
-  }
-  refreshStatus();
-  refreshMetrics();
-});
+  items.forEach((item) => {
+    const card = document.createElement('div');
+    card.className = 'payload-card';
+    const title = document.createElement('h4');
+    title.textContent = item.name;
+    const meta = document.createElement('div');
+    meta.className = 'payload-meta';
+    meta.textContent = `Format: ${item.format}${item.editable ? '' : ' (read-only)'}`;
+    const input = document.createElement('textarea');
+    input.value = item.value || '';
+    input.disabled = !item.editable;
+    const actions = document.createElement('div');
+    actions.className = 'payload-actions';
+    const button = document.createElement('button');
+    button.textContent = 'Update payload';
+    button.className = 'secondary';
+    button.disabled = !item.editable;
+    button.addEventListener('click', async () => {
+      await updatePayload(type, item.name, item.format, input.value);
+    });
+    actions.appendChild(button);
+    card.appendChild(title);
+    card.appendChild(meta);
+    card.appendChild(input);
+    card.appendChild(actions);
+    container.appendChild(card);
+  });
+}
 
-document.getElementById('stopBtn').addEventListener('click', async () => {
-  const response = await fetch('/api/stop', { method: 'POST' });
-  const data = await response.json();
-  if (response.ok) {
-    alert(data.message || 'Simulator stopped');
-  } else {
-    alert(data.error || 'Simulator not running');
+async function updatePayload(type, name, format, value) {
+  try {
+    const params = new URLSearchParams();
+    params.set('type', type);
+    params.set('name', name);
+    params.set('format', format);
+    params.set('value', value);
+    const response = await fetch('/api/simulator/payload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      showMessage(data.error || 'Unable to update payload.', 'error');
+      return;
+    }
+    showMessage(data.message || 'Payload updated.', 'success');
+    refreshPayloads();
+  } catch (error) {
+    showMessage('Unable to update payload: ' + error.message, 'error');
   }
-  refreshStatus();
-  refreshMetrics();
-});
+}
 
-loadConfigList();
+refreshSavedConfigs();
 refreshStatus();
 refreshMetrics();
-setInterval(() => {
-  refreshStatus();
-  refreshMetrics();
-}, 3000);
+setInterval(refreshStatus, 4000);
+setInterval(refreshMetrics, 5000);
 </script>
 </body>
 </html>)HTML";
@@ -1200,101 +1552,6 @@ std::string WebApplication::json_escape(const std::string &value)
         }
     }
     return stream.str();
-}
-
-std::string WebApplication::url_decode(const std::string &value)
-{
-    std::string result;
-    result.reserve(value.size());
-    for (std::size_t i = 0; i < value.size(); ++i) {
-        if (value[i] == '%' && i + 2 < value.size()) {
-            std::string hex = value.substr(i + 1, 2);
-            char *end = nullptr;
-            long decoded = std::strtol(hex.c_str(), &end, 16);
-            if (end != nullptr && *end == '\0') {
-                result.push_back(static_cast<char>(decoded));
-                i += 2;
-                continue;
-            }
-        } else if (value[i] == '+') {
-            result.push_back(' ');
-            continue;
-        }
-        result.push_back(value[i]);
-    }
-    return result;
-}
-
-std::string WebApplication::extract_parameter(const std::string &query, const std::string &key)
-{
-    std::size_t start = 0;
-    while (start < query.size()) {
-        auto end = query.find('&', start);
-        if (end == std::string::npos) {
-            end = query.size();
-        }
-        auto eq = query.find('=', start);
-        if (eq != std::string::npos && eq < end) {
-            std::string name = query.substr(start, eq - start);
-            if (name == key) {
-                return query.substr(eq + 1, end - eq - 1);
-            }
-        } else {
-            if (query.substr(start, end - start) == key) {
-                return std::string();
-            }
-        }
-        start = end + 1;
-    }
-    return std::string();
-}
-
-bool WebApplication::is_safe_config_relative_path(const std::string &path)
-{
-    if (path.empty()) {
-        return false;
-    }
-    unsigned char first = static_cast<unsigned char>(path.front());
-    if (first == '/' || first == '\\') {
-        return false;
-    }
-    if (path.find("..") != std::string::npos) {
-        return false;
-    }
-    if (path.find(':') != std::string::npos) {
-        return false;
-    }
-    if (path.find('\\') != std::string::npos) {
-        return false;
-    }
-    for (unsigned char ch : path) {
-        if (std::iscntrl(ch)) {
-            return false;
-        }
-    }
-    if (path.find("//") != std::string::npos) {
-        return false;
-    }
-    return true;
-}
-
-bool WebApplication::is_xml_file_name(const std::string &name)
-{
-    std::filesystem::path path(name);
-    auto extension = path.extension().string();
-    if (extension.empty()) {
-        return false;
-    }
-    std::string lower(extension.size(), '\0');
-    std::transform(extension.begin(), extension.end(), lower.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return lower == ".xml";
-}
-
-std::filesystem::path WebApplication::config_root()
-{
-    return std::filesystem::path("config");
 }
 
 }  // namespace trdp_sim

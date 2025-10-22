@@ -56,7 +56,12 @@ void MdSenderWorker::run()
     const auto interval = std::chrono::milliseconds(config_.cycleTimeMs);
     while (running_) {
         try {
-            adapter_.send_md_request(config_.name, payload_);
+            std::vector<std::uint8_t> payloadCopy;
+            {
+                std::lock_guard<std::mutex> lock(payloadMutex_);
+                payloadCopy = payload_;
+            }
+            adapter_.send_md_request(config_.name, payloadCopy);
             metrics_.record_md_request_sent(config_.name);
         } catch (const std::exception &ex) {
             logger_.error("MD request failed for '" + config_.name + "': " + ex.what());
@@ -64,6 +69,31 @@ void MdSenderWorker::run()
         std::this_thread::sleep_for(interval);
     }
     logger_.info("Stopping MD sender '" + config_.name + "'");
+}
+
+PayloadConfig MdSenderWorker::payload_config() const
+{
+    std::lock_guard<std::mutex> lock(payloadMutex_);
+    return config_.payload;
+}
+
+bool MdSenderWorker::update_payload(PayloadConfig::Format format, const std::string &value, std::string &error_message)
+{
+    PayloadConfig payloadSpec;
+    payloadSpec.format = format;
+    payloadSpec.value = value;
+    try {
+        auto data = load_payload(payloadSpec);
+        {
+            std::lock_guard<std::mutex> lock(payloadMutex_);
+            payload_ = std::move(data);
+            config_.payload = payloadSpec;
+        }
+        return true;
+    } catch (const std::exception &ex) {
+        error_message = ex.what();
+        return false;
+    }
 }
 
 }  // namespace trdp_sim

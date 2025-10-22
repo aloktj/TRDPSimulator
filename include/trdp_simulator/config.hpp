@@ -34,6 +34,9 @@ struct PayloadConfig {
     std::string value;
 };
 
+PayloadConfig::Format payload_format_from_string(const std::string &value);
+std::string payload_format_to_string(PayloadConfig::Format format);
+
 struct PdPublisherConfig {
     std::string name;
     std::uint32_t comId{0};

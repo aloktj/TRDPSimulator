@@ -3,6 +3,11 @@
 #include <iostream>
 #include <vector>
 
+int run_config_loader_test();
+namespace trdp_sim {
+int run_web_application_tests();
+}
+
 int main()
 {
     using namespace trdp_sim;
@@ -30,6 +35,14 @@ int main()
         return 1;
     } catch (const std::exception &) {
         // Expected path
+    }
+
+    if (run_config_loader_test() != 0) {
+        return 1;
+    }
+
+    if (trdp_sim::run_web_application_tests() != 0) {
+        return 1;
     }
 
     return 0;

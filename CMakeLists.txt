@@ -40,6 +40,7 @@ file(GLOB TRDP_SIMULATOR_HEADERS CONFIGURE_DEPENDS
 
 set(TRDP_SIMULATOR_CORE_SOURCES
     src/config.cpp
+    src/config_store.cpp
     src/config_loader.cpp
     src/logger.cpp
     src/runtime_metrics.cpp
@@ -609,6 +610,8 @@ endif()
 if (BUILD_TESTING)
     add_executable(trdp-simulator-tests
         tests/payload_tests.cpp
+        tests/config_loader_tests.cpp
+        tests/web_application_tests.cpp
     )
 
     target_link_libraries(trdp-simulator-tests PRIVATE trdp_simulator_core)

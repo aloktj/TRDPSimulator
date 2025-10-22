@@ -56,27 +56,13 @@ bool optional_bool_attribute(const tinyxml2::XMLElement &element, const char *na
     throw std::runtime_error(std::string("Invalid boolean attribute '") + name + "' in element '" + element.Name() + "'");
 }
 
-PayloadConfig::Format parse_payload_format(const std::string &value)
-{
-    if (value == "hex") {
-        return PayloadConfig::Format::Hex;
-    }
-    if (value == "text") {
-        return PayloadConfig::Format::Text;
-    }
-    if (value == "file") {
-        return PayloadConfig::Format::File;
-    }
-    throw std::runtime_error("Unsupported payload format: " + value);
-}
-
 PayloadConfig load_payload_element(const tinyxml2::XMLElement &element)
 {
     PayloadConfig payload;
     payload.value = element.GetText() ? std::string(element.GetText()) : std::string();
     const char *format = element.Attribute("format");
     if (format) {
-        payload.format = parse_payload_format(format);
+        payload.format = payload_format_from_string(format);
     }
     return payload;
 }
@@ -161,6 +147,52 @@ LogLevel parse_log_level(const std::string &value)
     throw std::runtime_error("Invalid log level: " + value);
 }
 
+SimulatorConfig load_configuration_from_document(tinyxml2::XMLDocument &doc)
+{
+    const auto *root = doc.RootElement();
+    if (!root || std::string(root->Name()) != "trdpSimulator") {
+        throw std::runtime_error("Root element <trdpSimulator> not found");
+    }
+
+    SimulatorConfig config;
+
+    if (const auto *networkElement = root->FirstChildElement("network")) {
+        config.network.interfaceName = optional_attribute(*networkElement, "interface", "eth0");
+        config.network.hostIp = optional_attribute(*networkElement, "hostIp");
+        config.network.gatewayIp = optional_attribute(*networkElement, "gateway");
+        config.network.vlanId = static_cast<std::uint16_t>(optional_uint_attribute(*networkElement, "vlanId"));
+        config.network.ttl = static_cast<std::uint8_t>(optional_uint_attribute(*networkElement, "ttl", 64));
+    }
+
+    if (const auto *loggingElement = root->FirstChildElement("logging")) {
+        config.logging.enableConsole = optional_bool_attribute(*loggingElement, "console", true);
+        config.logging.filePath = optional_attribute(*loggingElement, "file");
+        if (const char *level = loggingElement->Attribute("level")) {
+            config.logging.level = parse_log_level(level);
+        }
+    }
+
+    if (const auto *pdElement = root->FirstChildElement("pd")) {
+        for (auto *publisher = pdElement->FirstChildElement("publisher"); publisher; publisher = publisher->NextSiblingElement("publisher")) {
+            config.pdPublishers.emplace_back(load_pd_publisher(*publisher));
+        }
+        for (auto *subscriber = pdElement->FirstChildElement("subscriber"); subscriber; subscriber = subscriber->NextSiblingElement("subscriber")) {
+            config.pdSubscribers.emplace_back(load_pd_subscriber(*subscriber));
+        }
+    }
+
+    if (const auto *mdElement = root->FirstChildElement("md")) {
+        for (auto *sender = mdElement->FirstChildElement("sender"); sender; sender = sender->NextSiblingElement("sender")) {
+            config.mdSenders.emplace_back(load_md_sender(*sender));
+        }
+        for (auto *listener = mdElement->FirstChildElement("listener"); listener; listener = listener->NextSiblingElement("listener")) {
+            config.mdListeners.emplace_back(load_md_listener(*listener));
+        }
+    }
+
+    return config;
+}
+
 }  // namespace
 
 void validate_configuration(const SimulatorConfig &config)
@@ -210,47 +242,20 @@ SimulatorConfig load_configuration(const std::string &path)
         throw std::runtime_error("Failed to load configuration XML: " + std::string(doc.ErrorStr() ? doc.ErrorStr() : "unknown error"));
     }
 
-    const auto *root = doc.RootElement();
-    if (!root || std::string(root->Name()) != "trdpSimulator") {
-        throw std::runtime_error("Root element <trdpSimulator> not found");
+    SimulatorConfig config = load_configuration_from_document(doc);
+    validate_configuration(config);
+    return config;
+}
+
+SimulatorConfig load_configuration_from_string(const std::string &xml)
+{
+    tinyxml2::XMLDocument doc;
+    const auto result = doc.Parse(xml.c_str(), xml.size());
+    if (result != tinyxml2::XML_SUCCESS) {
+        throw std::runtime_error("Failed to parse configuration XML: " + std::string(doc.ErrorStr() ? doc.ErrorStr() : "unknown error"));
     }
 
-    SimulatorConfig config;
-
-    if (const auto *networkElement = root->FirstChildElement("network")) {
-        config.network.interfaceName = optional_attribute(*networkElement, "interface", "eth0");
-        config.network.hostIp = optional_attribute(*networkElement, "hostIp");
-        config.network.gatewayIp = optional_attribute(*networkElement, "gateway");
-        config.network.vlanId = static_cast<std::uint16_t>(optional_uint_attribute(*networkElement, "vlanId"));
-        config.network.ttl = static_cast<std::uint8_t>(optional_uint_attribute(*networkElement, "ttl", 64));
-    }
-
-    if (const auto *loggingElement = root->FirstChildElement("logging")) {
-        config.logging.enableConsole = optional_bool_attribute(*loggingElement, "console", true);
-        config.logging.filePath = optional_attribute(*loggingElement, "file");
-        if (const char *level = loggingElement->Attribute("level")) {
-            config.logging.level = parse_log_level(level);
-        }
-    }
-
-    if (const auto *pdElement = root->FirstChildElement("pd")) {
-        for (auto *publisher = pdElement->FirstChildElement("publisher"); publisher; publisher = publisher->NextSiblingElement("publisher")) {
-            config.pdPublishers.emplace_back(load_pd_publisher(*publisher));
-        }
-        for (auto *subscriber = pdElement->FirstChildElement("subscriber"); subscriber; subscriber = subscriber->NextSiblingElement("subscriber")) {
-            config.pdSubscribers.emplace_back(load_pd_subscriber(*subscriber));
-        }
-    }
-
-    if (const auto *mdElement = root->FirstChildElement("md")) {
-        for (auto *sender = mdElement->FirstChildElement("sender"); sender; sender = sender->NextSiblingElement("sender")) {
-            config.mdSenders.emplace_back(load_md_sender(*sender));
-        }
-        for (auto *listener = mdElement->FirstChildElement("listener"); listener; listener = listener->NextSiblingElement("listener")) {
-            config.mdListeners.emplace_back(load_md_listener(*listener));
-        }
-    }
-
+    SimulatorConfig config = load_configuration_from_document(doc);
     validate_configuration(config);
     return config;
 }

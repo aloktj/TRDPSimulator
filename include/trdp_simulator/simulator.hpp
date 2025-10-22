@@ -26,6 +26,15 @@ public:
     void stop();
 
     RuntimeMetrics::Snapshot metrics_snapshot() const;
+    SimulatorConfig current_config() const;
+    bool set_pd_payload(const std::string &publisher_name,
+                        PayloadConfig::Format format,
+                        const std::string &value,
+                        std::string &error_message);
+    bool set_md_payload(const std::string &sender_name,
+                        PayloadConfig::Format format,
+                        const std::string &value,
+                        std::string &error_message);
 
 private:
     void setup_logging();
@@ -45,7 +54,7 @@ private:
 
     std::atomic<bool> running_{false};
     std::thread eventThread_;
-    std::mutex stateMutex_;
+    mutable std::mutex stateMutex_;
     std::condition_variable stateCv_;
     bool cleanedUp_{false};
 };
