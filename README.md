@@ -116,3 +116,4 @@ During configuration CMake prints a status line for every simulator target indic
 ## License
 
 This project bundles [tinyxml2](https://github.com/leethomason/tinyxml2) under the zlib license in `third_party/tinyxml2`. The simulator source itself is distributed under the MIT license.
+
