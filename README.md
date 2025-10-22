@@ -64,6 +64,16 @@ Provide the XML configuration file with the `--config` option:
 
 Press `Ctrl+C` to stop the simulator. The stub adapter echoes PD and MD payloads locally so that configuration and logging can be validated without live TRDP traffic.
 
+### Web interface
+
+The `trdp-simulator-web` binary exposes a lightweight browser UI that runs the simulator on the host. Launch it after building:
+
+```bash
+./build/trdp-simulator-web --host 0.0.0.0 --port 8080
+```
+
+Open `http://<host>:8080` from a browser on the same network. Enter the absolute path to a configuration XML file on the host filesystem, then use the **Start simulator** and **Stop simulator** buttons to control execution. The status pane is refreshed every few seconds and reports whether the simulator is running as well as the most recent error (if any).
+
 ## Configuration file
 
 A single XML file controls every aspect of the simulator. See [`docs/configuration.example.xml`](docs/configuration.example.xml) for a detailed sample. At a glance:

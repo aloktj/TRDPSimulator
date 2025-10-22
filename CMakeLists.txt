@@ -36,16 +36,29 @@ file(GLOB TRDP_SIMULATOR_HEADERS CONFIGURE_DEPENDS
     include/trdp_simulator/*.hpp
 )
 
-set(TRDP_SIMULATOR_COMMON_SOURCES
-    src/main.cpp
+set(TRDP_SIMULATOR_CORE_SOURCES
     src/config.cpp
     src/config_loader.cpp
-    src/simulator.cpp
     src/logger.cpp
-    src/trdp_stack_adapter_factory.cpp
-    src/trdp_pd_worker.cpp
+    src/simulator.cpp
     src/trdp_md_worker.cpp
+    src/trdp_pd_worker.cpp
+    src/trdp_stack_adapter_factory.cpp
 )
+
+add_library(trdp_simulator_core
+    ${TRDP_SIMULATOR_CORE_SOURCES}
+    ${TRDP_SIMULATOR_HEADERS}
+)
+
+target_include_directories(trdp_simulator_core PUBLIC include)
+
+target_link_libraries(trdp_simulator_core
+    PUBLIC
+        tinyxml2
+)
+
+target_compile_features(trdp_simulator_core PUBLIC cxx_std_17)
 
 function(trdp_simulator_resolve_stack_root version out_var)
     string(REGEX REPLACE "[^0-9A-Za-z]" "_" version_token "${version}")
@@ -462,7 +475,12 @@ function(trdp_simulator_get_stack_target version stack_root out_target out_found
 endfunction()
 
 function(trdp_simulator_add_target target_name version)
-    cmake_parse_arguments(TRDP_SIM "" "OUTPUT_NAME" "" ${ARGN})
+    cmake_parse_arguments(TRDP_SIM "" "OUTPUT_NAME" "SOURCES" ${ARGN})
+
+    set(target_sources ${TRDP_SIM_SOURCES})
+    if (NOT target_sources)
+        set(target_sources src/main.cpp)
+    endif()
 
     set(use_real_stack OFF)
     set(trdp_stack_target "")
@@ -492,14 +510,11 @@ function(trdp_simulator_add_target target_name version)
     endif()
 
     add_executable(${target_name}
-        ${TRDP_SIMULATOR_COMMON_SOURCES}
+        ${target_sources}
         ${stack_adapter_source}
-        ${TRDP_SIMULATOR_HEADERS}
     )
 
-    target_include_directories(${target_name} PRIVATE include)
-    target_link_libraries(${target_name} PRIVATE tinyxml2)
-    target_compile_features(${target_name} PRIVATE cxx_std_17)
+    target_link_libraries(${target_name} PRIVATE trdp_simulator_core)
     target_compile_definitions(${target_name} PRIVATE TRDP_STACK_VERSION="${version}")
 
     if (use_real_stack)
@@ -520,6 +535,11 @@ list(GET TRDPSimulator_SUPPORTED_TRDP_VERSIONS 0 TRDPSimulator_LATEST_TRDP_VERSI
 
 if (TRDPSimulator_BUILD_ALL_TRDP_VERSIONS)
     trdp_simulator_add_target(trdp-simulator "${TRDPSimulator_LATEST_TRDP_VERSION}")
+    trdp_simulator_add_target(trdp-simulator-web "${TRDPSimulator_LATEST_TRDP_VERSION}"
+        SOURCES
+            src/web_main.cpp
+            src/web_application.cpp
+    )
     foreach(version IN LISTS TRDPSimulator_SUPPORTED_TRDP_VERSIONS)
         if (version STREQUAL TRDPSimulator_LATEST_TRDP_VERSION)
             continue()
@@ -541,6 +561,11 @@ else()
     endif()
 
     trdp_simulator_add_target(trdp-simulator "${requested_version}")
+    trdp_simulator_add_target(trdp-simulator-web "${requested_version}"
+        SOURCES
+            src/web_main.cpp
+            src/web_application.cpp
+    )
 endif()
 
 install(FILES docs/configuration.example.xml DESTINATION share/trdp-simulator)
