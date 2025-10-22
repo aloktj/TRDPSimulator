@@ -5,7 +5,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -21,6 +23,7 @@
 namespace trdp_sim {
 
 namespace {
+constexpr std::size_t kMaxConfigFileSize = 512 * 1024;
 std::string status_message_for(int code)
 {
     switch (code) {
@@ -40,6 +43,112 @@ std::string status_message_for(int code)
         return "Unknown";
     }
 }
+}
+
+WebApplication::HttpResponse WebApplication::make_error_response(int status, const std::string &message)
+{
+    return {status, "", "application/json",
+            "{\"error\":\"" + json_escape(message) + "\"}"};
+}
+
+const std::filesystem::path &WebApplication::resolved_config_root()
+{
+    static const std::filesystem::path root = std::filesystem::absolute(config_root());
+    return root;
+}
+
+bool WebApplication::ensure_config_directory(std::string &error)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(resolved_config_root(), ec)) {
+        if (ec) {
+            error = "Unable to access config directory: " + ec.message();
+            return false;
+        }
+        std::filesystem::create_directories(resolved_config_root(), ec);
+        if (ec) {
+            error = "Unable to create config directory: " + ec.message();
+            return false;
+        }
+    }
+    bool directory = std::filesystem::is_directory(resolved_config_root(), ec);
+    if (ec || !directory) {
+        error = ec ? "Unable to validate config directory: " + ec.message()
+                    : "Config path is not a directory";
+        return false;
+    }
+    return true;
+}
+
+bool WebApplication::ensure_config_directory()
+{
+    std::string error;
+    return ensure_config_directory(error);
+}
+
+std::string WebApplication::absolute_path_string(const std::filesystem::path &path)
+{
+    std::error_code ec;
+    auto absolute = std::filesystem::absolute(path, ec);
+    if (ec) {
+        return path.lexically_normal().generic_string();
+    }
+    return absolute.lexically_normal().generic_string();
+}
+
+WebApplication::HttpResponse WebApplication::write_config_file(const std::string &relative_path,
+                                                               const std::string &contents,
+                                                               const std::string &success_message)
+{
+    if (relative_path.empty()) {
+        return make_error_response(400, "Missing configuration path");
+    }
+    if (!is_safe_config_relative_path(relative_path)) {
+        return make_error_response(400, "Configuration path is not allowed");
+    }
+    if (!is_xml_file_name(relative_path)) {
+        return make_error_response(400, "Configuration files must use the .xml extension");
+    }
+    if (contents.size() > kMaxConfigFileSize) {
+        return make_error_response(400, "Configuration exceeds size limit (512 KB)");
+    }
+
+    std::string error;
+    if (!ensure_config_directory(error)) {
+        return make_error_response(500, error);
+    }
+
+    std::filesystem::path full_path = resolved_config_root() / std::filesystem::path(relative_path);
+    std::filesystem::path parent = full_path.parent_path();
+    std::error_code ec;
+    if (!parent.empty()) {
+        bool parent_exists = std::filesystem::exists(parent, ec);
+        if (ec) {
+            return make_error_response(500, "Unable to access parent directory: " + ec.message());
+        }
+        if (!parent_exists) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                return make_error_response(500, "Unable to create directories for configuration: " + ec.message());
+            }
+        }
+    }
+
+    std::ofstream output(full_path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return make_error_response(500, "Unable to open configuration file for writing");
+    }
+
+    output << contents;
+    if (!output) {
+        return make_error_response(500, "Failed to write configuration file");
+    }
+
+    std::ostringstream stream;
+    stream << "{\"message\":\"" << json_escape(success_message) << "\",\"path\":\""
+           << json_escape(relative_path) << "\",\"absolutePath\":\""
+           << json_escape(absolute_path_string(full_path)) << "\"}";
+    return {200, "OK", "application/json", stream.str()};
 }
 
 WebApplication::WebApplication(std::string host, unsigned short port)
@@ -368,6 +477,22 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
         } catch (const std::exception &ex) {
             return respond_json(400, "{\"error\":\"" + json_escape(ex.what()) + "\"}");
         }
+    }
+
+    if (path == "/api/config/list") {
+        return handle_list_configs();
+    }
+
+    if (path == "/api/config" && method == "GET") {
+        return handle_get_config(query);
+    }
+
+    if (path == "/api/config/save" && method == "POST") {
+        return handle_save_config(body);
+    }
+
+    if (path == "/api/config/upload" && method == "POST") {
+        return handle_upload_config(body);
     }
 
     if (path == "/api/start") {
@@ -868,6 +993,18 @@ section { margin-top: 2rem; }
 section:first-of-type { margin-top: 0; }
 pre { background: #f6f8fa; padding: 1rem; border-radius: 6px; overflow: auto; border: 1px solid #d0d7de; font-size: 0.9rem; }
 #status { font-weight: 600; }
+.control-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+.control-row button { margin-right: 0; }
+.config-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
+.config-controls select { flex: 1 1 260px; min-width: 220px; }
+.config-controls button { margin-right: 0; }
+.config-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
+.config-actions button { margin-right: 0; }
+.config-actions input[type="file"] { flex: 1 1 260px; }
+.notice { margin-top: 0.5rem; font-size: 0.9rem; }
+.notice.success { color: #1a7f37; }
+.notice.error { color: #cf222e; }
+.notice.muted { color: #57606a; font-style: italic; }
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
 .metrics-grid h3 { margin-top: 0; font-size: 1.05rem; }
 .metrics-grid ul { list-style: none; padding: 0.75rem; margin: 0; background: #f6f8fa; border-radius: 6px; border: 1px solid #d0d7de; }
@@ -1005,6 +1142,7 @@ function renderMetricList(elementId, items, formatter, emptyMessage) {
   if (!list) {
     return;
   }
+  const formatItem = typeof formatter === 'function' ? formatter : (value) => String(value);
   list.innerHTML = '';
   if (!Array.isArray(items) || items.length === 0) {
     const li = document.createElement('li');
@@ -1015,7 +1153,7 @@ function renderMetricList(elementId, items, formatter, emptyMessage) {
   }
   items.forEach((item) => {
     const li = document.createElement('li');
-    li.textContent = formatter(item);
+    li.textContent = formatItem(item);
     list.appendChild(li);
   });
 }

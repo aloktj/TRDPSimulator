@@ -98,6 +98,17 @@ private:
         return std::string();
     }
 
+    static bool is_safe_config_relative_path(const std::string &path);
+    static bool is_xml_file_name(const std::string &name);
+    static std::filesystem::path config_root();
+    static HttpResponse make_error_response(int status, const std::string &message);
+    static const std::filesystem::path &resolved_config_root();
+    static bool ensure_config_directory(std::string &error);
+    static bool ensure_config_directory();
+    static std::string absolute_path_string(const std::filesystem::path &path);
+    static HttpResponse write_config_file(const std::string &relative_path, const std::string &contents,
+                                          const std::string &success_message);
+
     void simulator_worker(std::string config_path);
 
     std::string host_;
