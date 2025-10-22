@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(CTest)
+
 option(TRDPSimulator_ENABLE_TRDP "Build with the TCNopen TRDP stack" ON)
 option(TRDPSimulator_BUILD_ALL_TRDP_VERSIONS "Build simulator binaries for every supported TRDP stack" OFF)
 
@@ -566,6 +568,16 @@ else()
             src/web_main.cpp
             src/web_application.cpp
     )
+endif()
+
+if (BUILD_TESTING)
+    add_executable(trdp-simulator-tests
+        tests/payload_tests.cpp
+    )
+
+    target_link_libraries(trdp-simulator-tests PRIVATE trdp_simulator_core)
+
+    add_test(NAME payload_tests COMMAND trdp-simulator-tests)
 endif()
 
 install(FILES docs/configuration.example.xml DESTINATION share/trdp-simulator)
