@@ -1,0 +1,13 @@
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+*.ninja
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.pdb
+compile_commands.json

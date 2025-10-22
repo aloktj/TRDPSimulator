@@ -1,1 +1,0 @@
-/usr/bin/c++ "CMakeFiles/trdp-simulator.dir/src/main.cpp.o" "CMakeFiles/trdp-simulator.dir/src/trdp_stack_adapter_stub.cpp.o" -o trdp-simulator  libtrdp_simulator_core.a libtinyxml2.a 
