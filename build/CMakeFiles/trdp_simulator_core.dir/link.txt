@@ -1,0 +1,2 @@
+/usr/bin/ar qc libtrdp_simulator_core.a CMakeFiles/trdp_simulator_core.dir/src/config.cpp.o CMakeFiles/trdp_simulator_core.dir/src/config_loader.cpp.o CMakeFiles/trdp_simulator_core.dir/src/logger.cpp.o CMakeFiles/trdp_simulator_core.dir/src/simulator.cpp.o CMakeFiles/trdp_simulator_core.dir/src/trdp_md_worker.cpp.o CMakeFiles/trdp_simulator_core.dir/src/trdp_pd_worker.cpp.o CMakeFiles/trdp_simulator_core.dir/src/trdp_stack_adapter_factory.cpp.o
+/usr/bin/ranlib libtrdp_simulator_core.a
