@@ -41,6 +41,12 @@ private:
     HttpResponse handle_request(const std::string &method, const std::string &target,
                                 const std::string &body);
 
+    HttpResponse handle_list_configs();
+    HttpResponse handle_get_config(const std::string &method, const std::string &query,
+                                   const std::string &body);
+    HttpResponse handle_save_config(const std::string &body);
+    HttpResponse handle_upload_config(const std::string &body);
+
     bool start_simulator(const std::string &config_path, const std::string &config_label, std::string &message);
     bool stop_simulator(std::string &message);
     std::string build_status_json() const;
