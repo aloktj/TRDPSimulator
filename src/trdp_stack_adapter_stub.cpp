@@ -18,6 +18,27 @@ std::string fallback_endpoint(const std::string &name, const std::string &ip)
     return ip.empty() ? name : ip;
 }
 
+MdSessionId make_session_id(std::uint32_t value)
+{
+    MdSessionId id{};
+    for (std::size_t index = 0; index < id.size(); ++index) {
+        id[id.size() - 1U - index] = static_cast<std::uint8_t>(value & 0xFFU);
+        value >>= 8U;
+    }
+    return id;
+}
+
+struct MdSessionIdHash {
+    std::size_t operator()(const MdSessionId &id) const noexcept
+    {
+        std::size_t value = 0U;
+        for (auto byte : id) {
+            value = (value * 131U) ^ static_cast<std::size_t>(byte);
+        }
+        return value;
+    }
+};
+
 class StubTrdpStackAdapter : public TrdpStackAdapter {
 public:
     void initialize(const NetworkConfig &, const LoggingConfig &) override {}
@@ -94,7 +115,7 @@ public:
         MdSenderConfig senderConfig;
         MdHandler replyHandler;
         std::vector<MdListenerState> listeners;
-        std::uint32_t sessionId{};
+        MdSessionId sessionId{};
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -105,7 +126,8 @@ public:
 
             senderConfig = it->second.config;
             replyHandler = it->second.replyHandler;
-            sessionId = nextSessionId_++;
+            const auto numericSession = nextSessionId_++;
+            sessionId = make_session_id(numericSession);
 
             for (const auto &listener : mdListeners_) {
                 if (!matches_md_listener(listener.config, senderConfig)) {
@@ -246,7 +268,7 @@ private:
     std::vector<PdSubscriberState> pdSubscribers_;
     std::unordered_map<std::string, MdSenderState> mdSenders_;
     std::vector<MdListenerState> mdListeners_;
-    std::unordered_map<std::uint32_t, MdSessionState> mdSessions_;
+    std::unordered_map<MdSessionId, MdSessionState, MdSessionIdHash> mdSessions_;
     std::atomic<std::uint32_t> nextSessionId_{1};
 };
 }  // namespace

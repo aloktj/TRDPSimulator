@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -18,11 +19,14 @@ struct PdMessage {
     std::uint64_t sequenceCounter{0};
 };
 
+inline constexpr std::size_t MdSessionIdSize = 16U;
+using MdSessionId = std::array<std::uint8_t, MdSessionIdSize>;
+
 struct MdMessage {
     std::string endpoint;
     std::uint32_t comId{0};
     std::vector<std::uint8_t> payload;
-    std::uint32_t sessionId{0};
+    MdSessionId sessionId{};
 };
 
 class TrdpStackAdapter {

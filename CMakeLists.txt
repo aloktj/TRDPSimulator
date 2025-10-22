@@ -46,6 +46,7 @@ set(TRDP_SIMULATOR_CORE_SOURCES
     src/trdp_md_worker.cpp
     src/trdp_pd_worker.cpp
     src/trdp_stack_adapter_factory.cpp
+    src/trdp_stack_adapter_stub.cpp
 )
 
 add_library(trdp_simulator_core
@@ -317,11 +318,31 @@ endfunction()
 function(trdp_simulator_build_stack_from_sources stack_target stack_root version version_token out_success)
     trdp_simulator_parse_trdp_config("${stack_root}" "${version_token}" config_path target_vos target_os compile_options compile_definitions private_includes link_options link_libraries link_directories)
 
+    set(fallback_used FALSE)
     if (config_path STREQUAL "")
-        message(WARNING "No TRDP configuration file found in ${stack_root}; cannot build stack version ${version} from sources.")
-        set(${out_success} FALSE PARENT_SCOPE)
-        return()
+        if (version STREQUAL "3.0.0.0")
+            set(target_vos "posix")
+            list(APPEND compile_options "-D_GNU_SOURCE")
+            list(APPEND compile_definitions "POSIX" "L_ENDIAN" "HAS_UUID" "MD_SUPPORT=1")
+            if (target_os STREQUAL "")
+                set(target_os "LINUX")
+            endif()
+            list(APPEND compile_definitions "${target_os}")
+            list(APPEND link_libraries "rt" "pthread" "uuid")
+            set(fallback_used TRUE)
+        endif()
+        if (NOT fallback_used)
+            message(WARNING "No TRDP configuration file found in ${stack_root}; cannot build stack version ${version} from sources.")
+            set(${out_success} FALSE PARENT_SCOPE)
+            return()
+        endif()
+        foreach(var_name IN ITEMS compile_options compile_definitions link_libraries)
+            if (${var_name})
+                list(REMOVE_DUPLICATES ${var_name})
+            endif()
+        endforeach()
     endif()
+
 
     set(vos_dir "${stack_root}/src/vos/${target_vos}")
     if (NOT EXISTS "${vos_dir}")
@@ -345,6 +366,17 @@ function(trdp_simulator_build_stack_from_sources stack_target stack_root version
 
     set(trdp_sources ${trdp_common_sources} ${trdp_vos_common_sources} ${trdp_vos_specific_sources})
     list(REMOVE_DUPLICATES trdp_sources)
+
+    set(tsn_enabled FALSE)
+    foreach(definition IN LISTS compile_definitions)
+        if (definition MATCHES "^TSN_SUPPORT(=1)?$")
+            set(tsn_enabled TRUE)
+            break()
+        endif()
+    endforeach()
+    if (NOT tsn_enabled)
+        list(FILTER trdp_sources EXCLUDE REGEX "/vos_sockTSN\\.c$")
+    endif()
 
     if (trdp_sources STREQUAL "")
         message(WARNING "No TRDP source files discovered in ${stack_root}; cannot build stack version ${version} from sources.")
@@ -508,13 +540,16 @@ function(trdp_simulator_add_target target_name version)
     if (use_real_stack)
         set(stack_adapter_source src/trdp_stack_adapter_real.cpp)
     else()
-        set(stack_adapter_source src/trdp_stack_adapter_stub.cpp)
+        set(stack_adapter_source "")
     endif()
 
     add_executable(${target_name}
         ${target_sources}
-        ${stack_adapter_source}
     )
+
+    if (stack_adapter_source)
+        target_sources(${target_name} PRIVATE ${stack_adapter_source})
+    endif()
 
     target_link_libraries(${target_name} PRIVATE trdp_simulator_core)
     target_compile_definitions(${target_name} PRIVATE TRDP_STACK_VERSION="${version}")
