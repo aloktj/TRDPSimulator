@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<trdpSimulator>
+  <network interface="eth1" hostIp="10.1.0.5" gateway="10.1.0.1" ttl="64" vlanId="2" />
+
+  <logging level="debug" console="true" file="logs/trdp-simulator.log" />
+
+  <pd>
+    <publisher name="TrainHeartbeat" comId="1001" datasetId="1" cycleTimeMs="500" sourceIp="10.1.0.5" destIp="239.10.0.10">
+      <payload format="text">Heartbeat</payload>
+    </publisher>
+
+    <publisher name="DoorStatus" comId="1002" datasetId="2" cycleTimeMs="100" sourceIp="10.1.0.5" destIp="239.10.0.11" useSequenceCounter="true">
+      <payload format="hex">0102030405060708</payload>
+    </publisher>
+
+    <subscriber name="TractionCommand" comId="2001" timeoutMs="1500" destIp="239.10.0.21" sourceIp="10.1.0.5" />
+
+    <subscriber name="PassengerAnnouncement" comId="2002" timeoutMs="3000" destIp="239.10.0.22" comIdFilter="true" />
+  </pd>
+
+  <md>
+    <sender name="MaintenanceRequest" comId="3001" replyComId="3002" destIp="10.1.0.20" cycleTimeMs="10000" expectReply="true" replyTimeoutMs="3000">
+      <payload format="text">Diagnostics request from simulator</payload>
+    </sender>
+
+    <sender name="DelayReport" comId="3003" destIp="239.10.1.30" cycleTimeMs="15000" expectReply="false">
+      <payload format="text">Delay report broadcast</payload>
+    </sender>
+
+    <listener name="MaintenanceReply" comId="3002" sourceIp="10.1.0.20" autoReply="true">
+      <replyPayload format="text">Diagnostics acknowledged</replyPayload>
+    </listener>
+
+    <listener name="DelayReportAck" comId="3004" destIp="239.10.1.30" autoReply="false" />
+  </md>
+</trdpSimulator>
