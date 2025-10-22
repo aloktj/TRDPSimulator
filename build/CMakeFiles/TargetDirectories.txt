@@ -1,0 +1,10 @@
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/tinyxml2.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/trdp_simulator_core.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/trdp-simulator.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/trdp-simulator-web.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/edit_cache.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/rebuild_cache.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/list_install_components.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/install.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/install/local.dir
+/home/dev/Downloads/project/git/TRDPSimulator/build/CMakeFiles/install/strip.dir
