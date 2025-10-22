@@ -5,11 +5,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
+#include <vector>
 
 #include "trdp_simulator/config_loader.hpp"
 #include "trdp_simulator/simulator.hpp"
@@ -18,6 +23,7 @@
 namespace trdp_sim {
 
 namespace {
+constexpr std::size_t kMaxConfigFileSize = 512 * 1024;
 std::string status_message_for(int code)
 {
     switch (code) {
@@ -37,6 +43,112 @@ std::string status_message_for(int code)
         return "Unknown";
     }
 }
+}
+
+WebApplication::HttpResponse WebApplication::make_error_response(int status, const std::string &message)
+{
+    return {status, "", "application/json",
+            "{\"error\":\"" + json_escape(message) + "\"}"};
+}
+
+const std::filesystem::path &WebApplication::resolved_config_root()
+{
+    static const std::filesystem::path root = std::filesystem::absolute(config_root());
+    return root;
+}
+
+bool WebApplication::ensure_config_directory(std::string &error)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(resolved_config_root(), ec)) {
+        if (ec) {
+            error = "Unable to access config directory: " + ec.message();
+            return false;
+        }
+        std::filesystem::create_directories(resolved_config_root(), ec);
+        if (ec) {
+            error = "Unable to create config directory: " + ec.message();
+            return false;
+        }
+    }
+    bool directory = std::filesystem::is_directory(resolved_config_root(), ec);
+    if (ec || !directory) {
+        error = ec ? "Unable to validate config directory: " + ec.message()
+                    : "Config path is not a directory";
+        return false;
+    }
+    return true;
+}
+
+bool WebApplication::ensure_config_directory()
+{
+    std::string error;
+    return ensure_config_directory(error);
+}
+
+std::string WebApplication::absolute_path_string(const std::filesystem::path &path)
+{
+    std::error_code ec;
+    auto absolute = std::filesystem::absolute(path, ec);
+    if (ec) {
+        return path.lexically_normal().generic_string();
+    }
+    return absolute.lexically_normal().generic_string();
+}
+
+WebApplication::HttpResponse WebApplication::write_config_file(const std::string &relative_path,
+                                                               const std::string &contents,
+                                                               const std::string &success_message)
+{
+    if (relative_path.empty()) {
+        return make_error_response(400, "Missing configuration path");
+    }
+    if (!is_safe_config_relative_path(relative_path)) {
+        return make_error_response(400, "Configuration path is not allowed");
+    }
+    if (!is_xml_file_name(relative_path)) {
+        return make_error_response(400, "Configuration files must use the .xml extension");
+    }
+    if (contents.size() > kMaxConfigFileSize) {
+        return make_error_response(400, "Configuration exceeds size limit (512 KB)");
+    }
+
+    std::string error;
+    if (!ensure_config_directory(error)) {
+        return make_error_response(500, error);
+    }
+
+    std::filesystem::path full_path = resolved_config_root() / std::filesystem::path(relative_path);
+    std::filesystem::path parent = full_path.parent_path();
+    std::error_code ec;
+    if (!parent.empty()) {
+        bool parent_exists = std::filesystem::exists(parent, ec);
+        if (ec) {
+            return make_error_response(500, "Unable to access parent directory: " + ec.message());
+        }
+        if (!parent_exists) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                return make_error_response(500, "Unable to create directories for configuration: " + ec.message());
+            }
+        }
+    }
+
+    std::ofstream output(full_path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return make_error_response(500, "Unable to open configuration file for writing");
+    }
+
+    output << contents;
+    if (!output) {
+        return make_error_response(500, "Failed to write configuration file");
+    }
+
+    std::ostringstream stream;
+    stream << "{\"message\":\"" << json_escape(success_message) << "\",\"path\":\""
+           << json_escape(relative_path) << "\",\"absolutePath\":\""
+           << json_escape(absolute_path_string(full_path)) << "\"}";
+    return {200, "OK", "application/json", stream.str()};
 }
 
 WebApplication::WebApplication(std::string host, unsigned short port)
@@ -232,6 +344,22 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
         return {200, "OK", "application/json", build_metrics_json()};
     }
 
+    if (path == "/api/config/list") {
+        return handle_list_configs();
+    }
+
+    if (path == "/api/config" && method == "GET") {
+        return handle_get_config(query);
+    }
+
+    if (path == "/api/config/save" && method == "POST") {
+        return handle_save_config(body);
+    }
+
+    if (path == "/api/config/upload" && method == "POST") {
+        return handle_upload_config(body);
+    }
+
     if (path == "/api/start") {
         std::string config = extract_parameter(query, "config");
         if (config.empty() && method == "POST") {
@@ -261,6 +389,123 @@ WebApplication::HttpResponse WebApplication::handle_request(const std::string &m
     }
 
     return {404, "Not Found", "application/json", "{\"error\":\"Not found\"}"};
+}
+
+WebApplication::HttpResponse WebApplication::handle_get_config(const std::string &query) const
+{
+    std::string error;
+    if (!ensure_config_directory(error)) {
+        return make_error_response(500, error);
+    }
+
+    std::string path = url_decode(extract_parameter(query, "path"));
+    if (path.empty()) {
+        return make_error_response(400, "Missing path parameter");
+    }
+    if (!is_safe_config_relative_path(path)) {
+        return make_error_response(400, "Configuration path is not allowed");
+    }
+
+    std::filesystem::path full_path = resolved_config_root() / std::filesystem::path(path);
+    std::error_code ec;
+    bool exists = std::filesystem::exists(full_path, ec);
+    if (ec || !exists) {
+        return make_error_response(404, ec ? "Unable to access configuration file: " + ec.message()
+                                          : "Configuration file not found");
+    }
+    bool regular = std::filesystem::is_regular_file(full_path, ec);
+    if (ec || !regular) {
+        return make_error_response(404, ec ? "Unable to access configuration file: " + ec.message()
+                                          : "Configuration file not found");
+    }
+
+    auto size = std::filesystem::file_size(full_path, ec);
+    if (ec) {
+        return make_error_response(500, "Unable to read configuration file: " + ec.message());
+    }
+    if (size > kMaxConfigFileSize) {
+        return make_error_response(400, "Configuration exceeds size limit (512 KB)");
+    }
+
+    std::ifstream input(full_path, std::ios::binary);
+    if (!input) {
+        return make_error_response(500, "Unable to open configuration file");
+    }
+
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    if (!input.good() && !input.eof()) {
+        return make_error_response(500, "Failed to read configuration file");
+    }
+
+    std::ostringstream body;
+    body << "{\"path\":\"" << json_escape(path) << "\",\"absolutePath\":\""
+         << json_escape(absolute_path_string(full_path)) << "\",\"contents\":\""
+         << json_escape(contents.str()) << "\"}";
+    return {200, "OK", "application/json", body.str()};
+}
+
+WebApplication::HttpResponse WebApplication::handle_list_configs() const
+{
+    std::string error;
+    if (!ensure_config_directory(error)) {
+        return make_error_response(500, error);
+    }
+
+    std::error_code ec;
+    std::vector<std::pair<std::string, std::string>> files;
+    for (std::filesystem::recursive_directory_iterator it(resolved_config_root(), ec), end;
+         it != end && !ec; ++it) {
+        if (!it->is_regular_file(ec) || ec) {
+            continue;
+        }
+        if (!it->path().has_extension()) {
+            continue;
+        }
+        if (!is_xml_file_name(it->path().filename().string())) {
+            continue;
+        }
+        std::filesystem::path rel = it->path().lexically_relative(resolved_config_root());
+        std::string rel_str = rel.generic_string();
+        if (!is_safe_config_relative_path(rel_str)) {
+            continue;
+        }
+        files.emplace_back(rel_str, absolute_path_string(it->path()));
+    }
+
+    if (ec) {
+        return make_error_response(500, "Unable to list configuration directory: " + ec.message());
+    }
+
+    std::sort(files.begin(), files.end(), [](const auto &lhs, const auto &rhs) {
+        return lhs.first < rhs.first;
+    });
+
+    std::ostringstream stream;
+    stream << "{\"files\":[";
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        if (i != 0) {
+            stream << ',';
+        }
+        stream << "{\"path\":\"" << json_escape(files[i].first) << "\",\"absolutePath\":\""
+               << json_escape(files[i].second) << "\"}";
+    }
+    stream << "]}";
+    return {200, "OK", "application/json", stream.str()};
+}
+
+WebApplication::HttpResponse WebApplication::handle_save_config(const std::string &body) const
+{
+    std::string path = url_decode(extract_parameter(body, "path"));
+    std::string contents = url_decode(extract_parameter(body, "contents"));
+    return write_config_file(path, contents, "Saved configuration");
+}
+
+WebApplication::HttpResponse WebApplication::handle_upload_config(const std::string &body) const
+{
+    std::string file_name = url_decode(extract_parameter(body, "fileName"));
+    std::string contents = url_decode(extract_parameter(body, "contents"));
+    return write_config_file(file_name, contents, "Uploaded configuration");
 }
 
 bool WebApplication::start_simulator(const std::string &config_path, std::string &message)
@@ -521,16 +766,30 @@ std::string WebApplication::main_page_html()
 <title>TRDP Simulator Web</title>
 <style>
 body { font-family: sans-serif; margin: 2rem; background: #f6f8fa; color: #1f2328; }
-main { max-width: 720px; margin: 0 auto; padding: 2rem; background: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(31,35,40,0.1); }
+main { max-width: 780px; margin: 0 auto; padding: 2rem; background: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(31,35,40,0.1); }
 header { margin-bottom: 1.5rem; }
 label { display: block; margin-bottom: 0.5rem; font-weight: 600; }
 input[type="text"] { width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #d0d7de; border-radius: 4px; }
+select { width: 100%; padding: 0.5rem; border: 1px solid #d0d7de; border-radius: 4px; background: #ffffff; }
+textarea { width: 100%; min-height: 260px; padding: 0.75rem; border: 1px solid #d0d7de; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.9rem; line-height: 1.4; }
 button { padding: 0.5rem 1rem; margin-right: 0.5rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
 button.start { background: #238636; color: #ffffff; }
 button.stop { background: #d1242f; color: #ffffff; }
 section { margin-top: 1.5rem; }
 pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; border: 1px solid #d0d7de; }
 #status { font-weight: 600; }
+.control-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+.control-row button { margin-right: 0; }
+.config-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
+.config-controls select { flex: 1 1 260px; min-width: 220px; }
+.config-controls button { margin-right: 0; }
+.config-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
+.config-actions button { margin-right: 0; }
+.config-actions input[type="file"] { flex: 1 1 260px; }
+.notice { margin-top: 0.5rem; font-size: 0.9rem; }
+.notice.success { color: #1a7f37; }
+.notice.error { color: #cf222e; }
+.notice.muted { color: #57606a; font-style: italic; }
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
 .metrics-grid h3 { margin-top: 0; font-size: 1.05rem; }
 .metrics-grid ul { list-style: none; padding: 0.75rem; margin: 0; background: #f6f8fa; border-radius: 4px; border: 1px solid #d0d7de; }
@@ -547,7 +806,7 @@ pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; bo
 </header>
 <label for="configPath">Configuration file</label>
 <input id="configPath" type="text" placeholder="/path/to/configuration.xml" />
-<div>
+<div class="control-row">
 <button class="start" id="startBtn">Start simulator</button>
 <button class="stop" id="stopBtn">Stop simulator</button>
 </div>
@@ -556,6 +815,26 @@ pre { background: #f6f8fa; padding: 1rem; border-radius: 4px; overflow: auto; bo
 <p id="status">Loading...</p>
 <p><strong>Simulator:</strong> <span id="simulatorState">Unknown</span></p>
 <pre id="details"></pre>
+</section>
+<section>
+<h2>Configuration editor</h2>
+<p>Manage XML files stored under <code>config/</code>. Load, edit, save, or upload new configurations without leaving the dashboard.</p>
+<label for="configSelect">Available configurations</label>
+<div class="config-controls">
+<select id="configSelect"></select>
+<button id="loadConfigBtn" type="button">Load</button>
+<button id="useConfigBtn" type="button">Use for start</button>
+</div>
+<label for="configEditorPath">File name (relative to <code>config/</code>)</label>
+<input id="configEditorPath" type="text" placeholder="example_configuration.xml" />
+<label for="configEditorContents">Contents</label>
+<textarea id="configEditorContents" placeholder="&lt;trdpSimulator&gt;&#10;  ...&#10;&lt;/trdpSimulator&gt;"></textarea>
+<div class="config-actions">
+<button id="saveConfigBtn" type="button">Save changes</button>
+<input id="configUpload" type="file" accept=".xml" />
+<button id="uploadConfigBtn" type="button">Upload file</button>
+</div>
+<p id="configMessage" class="notice muted"></p>
 </section>
 <section>
 <h2>Telemetry</h2>
@@ -587,6 +866,7 @@ function renderMetricList(elementId, items, formatter, emptyMessage) {
   if (!list) {
     return;
   }
+  const formatItem = typeof formatter === 'function' ? formatter : (value) => String(value);
   list.innerHTML = '';
   if (!Array.isArray(items) || items.length === 0) {
     const li = document.createElement('li');
@@ -597,10 +877,206 @@ function renderMetricList(elementId, items, formatter, emptyMessage) {
   }
   items.forEach((item) => {
     const li = document.createElement('li');
-    li.textContent = formatter(item);
+    li.textContent = formatItem(item);
     list.appendChild(li);
   });
 }
+
+let lastLoadedConfig = null;
+
+function setConfigMessage(message, type = 'info') {
+  const element = document.getElementById('configMessage');
+  if (!element) {
+    return;
+  }
+  element.textContent = message || '';
+  element.classList.remove('success', 'error', 'muted');
+  if (!message) {
+    element.classList.add('muted');
+    return;
+  }
+  if (type === 'success') {
+    element.classList.add('success');
+  } else if (type === 'error') {
+    element.classList.add('error');
+  } else {
+    element.classList.add('muted');
+  }
+}
+
+async function loadConfigList(selectedPath = null) {
+  const select = document.getElementById('configSelect');
+  if (!select) {
+    return;
+  }
+  const previous = selectedPath || select.dataset.selected || '';
+  try {
+    const response = await fetch('/api/config/list');
+    if (!response.ok) {
+      throw new Error('Request failed');
+    }
+    const data = await response.json();
+    const files = Array.isArray(data.files) ? data.files : [];
+    select.innerHTML = '';
+    if (files.length === 0) {
+      const option = document.createElement('option');
+      option.textContent = 'No configurations found';
+      option.value = '';
+      option.disabled = true;
+      select.appendChild(option);
+      select.dataset.selected = '';
+      return;
+    }
+    files.forEach((file) => {
+      const option = document.createElement('option');
+      option.value = file.path;
+      option.textContent = file.path;
+      if (file.absolutePath) {
+        option.dataset.absolutePath = file.absolutePath;
+      }
+      select.appendChild(option);
+    });
+    const target = files.some((file) => file.path === previous) ? previous : files[0].path;
+    select.value = target;
+    select.dataset.selected = select.value;
+  } catch (err) {
+    select.innerHTML = '';
+    const option = document.createElement('option');
+    option.textContent = 'Unable to load configurations';
+    option.value = '';
+    option.disabled = true;
+    select.appendChild(option);
+    select.dataset.selected = '';
+    setConfigMessage('Unable to load configuration list.', 'error');
+  }
+}
+
+async function fetchConfiguration(path) {
+  try {
+    const response = await fetch('/api/config?path=' + encodeURIComponent(path));
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Request failed');
+    }
+    const data = await response.json();
+    document.getElementById('configEditorPath').value = data.path || path;
+    document.getElementById('configEditorContents').value = data.contents || '';
+    if (data.absolutePath) {
+      document.getElementById('configPath').value = data.absolutePath;
+    }
+    lastLoadedConfig = data;
+    setConfigMessage(`Loaded ${data.path || path}.`, 'success');
+    await loadConfigList(data.path);
+  } catch (err) {
+    setConfigMessage(err.message || 'Unable to load configuration.', 'error');
+  }
+}
+
+async function saveConfiguration() {
+  const pathInput = document.getElementById('configEditorPath');
+  const contentsInput = document.getElementById('configEditorContents');
+  const path = pathInput.value.trim();
+  if (!path) {
+    setConfigMessage('Enter a file name before saving.', 'error');
+    return;
+  }
+  const body = 'path=' + encodeURIComponent(path) + '&contents=' + encodeURIComponent(contentsInput.value);
+  try {
+    const response = await fetch('/api/config/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Unable to save configuration.');
+    }
+    pathInput.value = data.path || path;
+    if (data.absolutePath) {
+      document.getElementById('configPath').value = data.absolutePath;
+    }
+    lastLoadedConfig = data;
+    setConfigMessage(data.message || 'Configuration saved.', 'success');
+    await loadConfigList(data.path);
+  } catch (err) {
+    setConfigMessage(err.message || 'Unable to save configuration.', 'error');
+  }
+}
+
+async function uploadConfiguration() {
+  const fileInput = document.getElementById('configUpload');
+  if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+    setConfigMessage('Select an XML file to upload.', 'error');
+    return;
+  }
+  const file = fileInput.files[0];
+  if (file.size > 524288) {
+    setConfigMessage('Selected file is larger than 512 KB.', 'error');
+    return;
+  }
+  try {
+    const contents = await file.text();
+    const body = 'fileName=' + encodeURIComponent(file.name) + '&contents=' + encodeURIComponent(contents);
+    const response = await fetch('/api/config/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Unable to upload configuration.');
+    }
+    document.getElementById('configEditorPath').value = data.path || file.name;
+    document.getElementById('configEditorContents').value = contents;
+    if (data.absolutePath) {
+      document.getElementById('configPath').value = data.absolutePath;
+    }
+    fileInput.value = '';
+    lastLoadedConfig = data;
+    setConfigMessage(data.message || 'Configuration uploaded.', 'success');
+    await loadConfigList(data.path);
+  } catch (err) {
+    setConfigMessage(err.message || 'Unable to upload configuration.', 'error');
+  }
+}
+
+document.getElementById('loadConfigBtn').addEventListener('click', async () => {
+  const select = document.getElementById('configSelect');
+  if (!select || !select.value) {
+    setConfigMessage('Select a configuration to load.', 'error');
+    return;
+  }
+  await fetchConfiguration(select.value);
+});
+
+document.getElementById('useConfigBtn').addEventListener('click', () => {
+  const startInput = document.getElementById('configPath');
+  if (!startInput) {
+    return;
+  }
+  if (lastLoadedConfig && lastLoadedConfig.absolutePath) {
+    startInput.value = lastLoadedConfig.absolutePath;
+    setConfigMessage('Configuration path copied to start field.', 'success');
+    return;
+  }
+  const select = document.getElementById('configSelect');
+  const option = select && select.selectedOptions && select.selectedOptions[0] ? select.selectedOptions[0] : null;
+  if (option && option.dataset.absolutePath) {
+    startInput.value = option.dataset.absolutePath;
+    setConfigMessage('Configuration path copied to start field.', 'success');
+    return;
+  }
+  const relative = document.getElementById('configEditorPath').value.trim();
+  if (!relative) {
+    setConfigMessage('Load or enter a configuration file name first.', 'error');
+    return;
+  }
+  startInput.value = 'config/' + relative;
+  setConfigMessage('Using config/' + relative + ' for simulator start.', 'success');
+});
+
+document.getElementById('saveConfigBtn').addEventListener('click', saveConfiguration);
+document.getElementById('uploadConfigBtn').addEventListener('click', uploadConfiguration);
 
 async function refreshStatus() {
   try {
@@ -642,10 +1118,10 @@ async function refreshMetrics() {
     document.getElementById('metricsRaw').textContent = JSON.stringify(data, null, 2);
   } catch (err) {
     document.getElementById('adapterState').textContent = 'Unavailable';
-    renderMetricList('pdPublishersList', [], null, 'No data available');
-    renderMetricList('pdSubscribersList', [], null, 'No data available');
-    renderMetricList('mdSendersList', [], null, 'No data available');
-    renderMetricList('mdListenersList', [], null, 'No data available');
+    renderMetricList('pdPublishersList', [], () => '', 'No data available');
+    renderMetricList('pdSubscribersList', [], () => '', 'No data available');
+    renderMetricList('mdSendersList', [], () => '', 'No data available');
+    renderMetricList('mdListenersList', [], () => '', 'No data available');
     document.getElementById('metricsRaw').textContent = 'Unable to query metrics';
   }
 }
@@ -679,6 +1155,7 @@ document.getElementById('stopBtn').addEventListener('click', async () => {
   refreshMetrics();
 });
 
+loadConfigList();
 refreshStatus();
 refreshMetrics();
 setInterval(() => {
@@ -770,6 +1247,54 @@ std::string WebApplication::extract_parameter(const std::string &query, const st
         start = end + 1;
     }
     return std::string();
+}
+
+bool WebApplication::is_safe_config_relative_path(const std::string &path)
+{
+    if (path.empty()) {
+        return false;
+    }
+    unsigned char first = static_cast<unsigned char>(path.front());
+    if (first == '/' || first == '\\') {
+        return false;
+    }
+    if (path.find("..") != std::string::npos) {
+        return false;
+    }
+    if (path.find(':') != std::string::npos) {
+        return false;
+    }
+    if (path.find('\\') != std::string::npos) {
+        return false;
+    }
+    for (unsigned char ch : path) {
+        if (std::iscntrl(ch)) {
+            return false;
+        }
+    }
+    if (path.find("//") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+bool WebApplication::is_xml_file_name(const std::string &name)
+{
+    std::filesystem::path path(name);
+    auto extension = path.extension().string();
+    if (extension.empty()) {
+        return false;
+    }
+    std::string lower(extension.size(), '\0');
+    std::transform(extension.begin(), extension.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lower == ".xml";
+}
+
+std::filesystem::path WebApplication::config_root()
+{
+    return std::filesystem::path("config");
 }
 
 }  // namespace trdp_sim

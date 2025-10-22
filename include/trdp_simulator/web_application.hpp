@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,6 +36,11 @@ private:
     HttpResponse handle_request(const std::string &method, const std::string &target,
                                 const std::string &body);
 
+    HttpResponse handle_get_config(const std::string &query) const;
+    HttpResponse handle_list_configs() const;
+    HttpResponse handle_save_config(const std::string &body) const;
+    HttpResponse handle_upload_config(const std::string &body) const;
+
     bool start_simulator(const std::string &config_path, std::string &message);
     bool stop_simulator(std::string &message);
     std::string build_status_json() const;
@@ -44,6 +50,17 @@ private:
     static std::string json_escape(const std::string &value);
     static std::string url_decode(const std::string &value);
     static std::string extract_parameter(const std::string &query, const std::string &key);
+
+    static bool is_safe_config_relative_path(const std::string &path);
+    static bool is_xml_file_name(const std::string &name);
+    static std::filesystem::path config_root();
+    static HttpResponse make_error_response(int status, const std::string &message);
+    static const std::filesystem::path &resolved_config_root();
+    static bool ensure_config_directory(std::string &error);
+    static bool ensure_config_directory();
+    static std::string absolute_path_string(const std::filesystem::path &path);
+    static HttpResponse write_config_file(const std::string &relative_path, const std::string &contents,
+                                          const std::string &success_message);
 
     void simulator_worker(std::string config_path);
 
